@@ -10,6 +10,8 @@
     "thinkingLow": "thinkingLow",
     "thinkingMedium": "thinkingMedium",
     "thinkingHigh": "thinkingHigh",
+    "thinkingXhigh": "rainbow",
+    "thinkingMax": "rainbow",
     "context": "dim",
     "contextWarn": "warning",
     "contextError": "error",

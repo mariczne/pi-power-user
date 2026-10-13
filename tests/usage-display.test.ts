@@ -34,13 +34,15 @@ function createSegmentContext(options: StatusLineSegmentOptions = {}, overrides:
     model: undefined,
     thinkingLevel: "off",
     sessionId: undefined,
-    usageStats: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 },
+    usageStats: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, subagentCost: 0 },
     contextTokens: 0,
     contextPercent: 0,
     contextWindow: 0,
+    contextApproximate: false,
     autoCompactEnabled: true,
     customCompactionEnabled: false,
     usingSubscription: false,
+    queueSummary: { queueCount: 0, blockedCount: 0, compacting: false, leadingText: null, leadingIntent: null, leadingStatus: null },
     sessionStartTime: Date.now(),
     shellModeActive: false,
     shellRunning: false,
@@ -81,6 +83,40 @@ test("context_pct percent format renders a bare rounded percentage", () => {
   assert.equal(stripAnsi(rendered.content), "6%");
 });
 
+test("context_pct renders unknown usage after compaction", () => {
+  const full = createSegmentContext({}, {
+    contextTokens: null,
+    contextWindow: 200000,
+    contextPercent: null,
+  });
+  const percent = createSegmentContext({ context: { format: "percent" } }, {
+    contextTokens: null,
+    contextWindow: 200000,
+    contextPercent: null,
+  });
+
+  assert.equal(stripAnsi(renderSegment("context_pct", full).content), "◫ ?/200k AC");
+  assert.equal(stripAnsi(renderSegment("context_pct", percent).content), "?");
+});
+
+test("context_pct marks context estimates as approximate", () => {
+  const full = createSegmentContext({}, {
+    contextTokens: 18000,
+    contextWindow: 272000,
+    contextPercent: 6.6176,
+    contextApproximate: true,
+  });
+  const percent = createSegmentContext({ context: { format: "percent" } }, {
+    contextTokens: 18000,
+    contextWindow: 272000,
+    contextPercent: 6.6176,
+    contextApproximate: true,
+  });
+
+  assert.equal(stripAnsi(renderSegment("context_pct", full).content), "◫ ~18k/272k (6.6%) AC");
+  assert.equal(stripAnsi(renderSegment("context_pct", percent).content), "~7%");
+});
+
 test("context_pct percent format keeps threshold colors and drops icons", () => {
   for (const [percent, expected] of [[69, "69%"], [85, "85%"], [95, "95%"]] as const) {
     const ctx = createSegmentContext({ context: { format: "percent" } }, {
@@ -99,7 +135,7 @@ test("context_pct percent format keeps threshold colors and drops icons", () => 
 
 test("cache_read defaults to raw token count", () => {
   const ctx = createSegmentContext({}, {
-    usageStats: { input: 1000, output: 0, cacheRead: 12300, cacheWrite: 0, cost: 0 },
+    usageStats: { input: 1000, output: 0, cacheRead: 12300, cacheWrite: 0, cost: 0, subagentCost: 0 },
   });
 
   const rendered = renderSegment("cache_read", ctx);
@@ -108,22 +144,58 @@ test("cache_read defaults to raw token count", () => {
 
 test("cache_read percent format renders the cache hit rate", () => {
   const ctx = createSegmentContext({ cache_read: { format: "percent" } }, {
-    usageStats: { input: 2000, output: 0, cacheRead: 8000, cacheWrite: 0, cost: 0 },
+    usageStats: { input: 2000, output: 0, cacheRead: 8000, cacheWrite: 0, cost: 0, subagentCost: 0 },
   });
 
   const rendered = renderSegment("cache_read", ctx);
   assert.equal(stripAnsi(rendered.content), "cache 80%");
 });
 
-test("cache_read percent format handles zero total without NaN", () => {
-  const ctx = createSegmentContext({ cache_read: { format: "percent" } }, {
-    usageStats: { input: 0, output: 0, cacheRead: 5, cacheWrite: 0, cost: 0 },
+test("cache_read both format renders raw token count and cache hit rate", () => {
+  const ctx = createSegmentContext({ cache_read: { format: "both" } }, {
+    usageStats: { input: 2000, output: 0, cacheRead: 8000, cacheWrite: 0, cost: 0, subagentCost: 0 },
   });
-  assert.equal(stripAnsi(renderSegment("cache_read", ctx).content), "cache 100%");
 
-  // cacheRead = 0 hides the segment entirely in both formats
-  const hidden = createSegmentContext({ cache_read: { format: "percent" } });
+  const rendered = renderSegment("cache_read", ctx);
+  assert.equal(stripAnsi(rendered.content), "cache in: 8.0k (80%)");
+});
+
+test("cache_read percent and both formats handle zero input without NaN", () => {
+  const percentCtx = createSegmentContext({ cache_read: { format: "percent" } }, {
+    usageStats: { input: 0, output: 0, cacheRead: 5, cacheWrite: 0, cost: 0, subagentCost: 0 },
+  });
+  assert.equal(stripAnsi(renderSegment("cache_read", percentCtx).content), "cache 100%");
+
+  const bothCtx = createSegmentContext({ cache_read: { format: "both" } }, {
+    usageStats: { input: 0, output: 0, cacheRead: 5, cacheWrite: 0, cost: 0, subagentCost: 0 },
+  });
+  assert.equal(stripAnsi(renderSegment("cache_read", bothCtx).content), "cache in: 5 (100%)");
+
+  const hidden = createSegmentContext({ cache_read: { format: "both" } });
   assert.deepEqual(renderSegment("cache_read", hidden), { content: "", visible: false });
+});
+
+// ── queue segment ──────────────────────────────────────────────────────────
+
+test("queue segment hides when empty", () => {
+  const ctx = createSegmentContext();
+  assert.deepEqual(renderSegment("queue", ctx), { content: "", visible: false });
+});
+
+test("queue segment summarizes queued and blocked items", () => {
+  const ctx = createSegmentContext({}, {
+    queueSummary: { queueCount: 2, blockedCount: 1, compacting: false, leadingText: "fix README", leadingIntent: "post-compact", leadingStatus: "blocked" },
+  });
+
+  assert.equal(stripAnsi(renderSegment("queue", ctx).content), "q 2 · blocked 1");
+});
+
+test("queue segment highlights compaction-held prompts", () => {
+  const ctx = createSegmentContext({}, {
+    queueSummary: { queueCount: 1, blockedCount: 0, compacting: true, leadingText: "run after compact", leadingIntent: "post-compact", leadingStatus: "queued" },
+  });
+
+  assert.equal(stripAnsi(renderSegment("queue", ctx).content), "compact q 1");
 });
 
 // ── config parsing / merging ────────────────────────────────────────────────
@@ -131,11 +203,11 @@ test("cache_read percent format handles zero total without NaN", () => {
 test("parsePowerlineConfig accepts context and cache_read formats", () => {
   const config = parsePowerlineConfig({
     context: { format: "percent" },
-    cache_read: { format: "percent" },
+    cache_read: { format: "both" },
   }, PRESET_NAMES);
 
   assert.equal(config.segmentOptions.context?.format, "percent");
-  assert.equal(config.segmentOptions.cache_read?.format, "percent");
+  assert.equal(config.segmentOptions.cache_read?.format, "both");
 });
 
 test("parsePowerlineConfig ignores invalid format values", () => {
@@ -157,9 +229,9 @@ test("parsePowerlineConfig defaults to upstream rendering when options are absen
 test("mergeSegmentOptions merges context and cache_read per key", () => {
   const merged = mergeSegmentOptions(
     { context: { format: "percent" }, cache_read: { format: "percent" } },
-    { context: { format: "full" } },
+    { context: { format: "full" }, cache_read: { format: "both" } },
   );
 
   assert.equal(merged.context?.format, "full");
-  assert.equal(merged.cache_read?.format, "percent");
+  assert.equal(merged.cache_read?.format, "both");
 });

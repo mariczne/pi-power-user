@@ -5,8 +5,8 @@ import {
   type Theme,
 } from "@earendil-works/pi-coding-agent";
 import type { AssistantMessage } from "@earendil-works/pi-ai";
-import { fuzzyFilter, isKeyRelease, matchesKey, type AutocompleteProvider, type SelectItem, SelectList, truncateToWidth, TUI_KEYBINDINGS, visibleWidth } from "@earendil-works/pi-tui";
-import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync } from "node:fs";
+import { CURSOR_MARKER, fuzzyFilter, isKeyRelease, matchesKey, type AutocompleteProvider, type SelectItem, SelectList, truncateToWidth, TUI_KEYBINDINGS, visibleWidth } from "@earendil-works/pi-tui";
+import { closeSync, existsSync, mkdirSync, openSync, readFileSync, readSync, readdirSync, statSync, writeFileSync } from "node:fs";
 import { join, dirname } from "node:path";
 
 import type { ColorScheme, SegmentContext, StatusLinePreset, StatusLineSegmentId, StatusLineSeparatorStyle } from "./types.ts";
@@ -19,7 +19,7 @@ import {
   ModeAwareAutocompleteProvider,
   OneOffBashAutocompleteProvider,
 } from "./bash-mode/completion.ts";
-import { BashModeEditor } from "./bash-mode/editor.ts";
+import { BashModeEditor, isPrintableInput } from "./bash-mode/editor.ts";
 import { ManagedShellSession } from "./bash-mode/shell-session.ts";
 import { matchHistoryEntries, readGlobalShellHistory, readProjectHistory, appendProjectHistory } from "./bash-mode/history.ts";
 import type { BashModeSettings } from "./bash-mode/types.ts";
@@ -28,27 +28,30 @@ import { getAgentPath } from "./paths.ts";
 import { collectHiddenExtensionStatusKeys, getNotificationExtensionStatuses, mergeSegmentOptions, mergeSegmentsWithCustomItems, nextPowerlineSettingWithOptions, nextPowerlineSettingWithPreset, parsePowerlineConfig } from "./powerline-config.ts";
 import { getSeparator } from "./separators.ts";
 import { renderSegment } from "./segments.ts";
-import { getGitStatus, invalidateGitStatus, invalidateGitBranch } from "./git-status.ts";
-import { SessionTokenStatsCache } from "./token-stats.ts";
+import { resolveThinkingLevelSelection } from "./thinking-level.ts";
+import { getGitStatus, invalidateGitStatus, invalidateGitBranch, subscribeGitUpdates } from "./git-status.ts";
+import { SessionBranchCache, SessionTokenStatsCache } from "./token-stats.ts";
 import { ansi, getFgAnsiCode } from "./colors.ts";
 import { WelcomeComponent, WelcomeHeader, discoverLoadedCounts, getRecentSessions } from "./welcome.ts";
-import { createWelcomeDismissScheduler } from "./welcome-dismiss.ts";
 import { createRenderScheduler } from "./render-scheduler.ts";
 import { getEditorAutocompleteProvider, passAutocompleteProviderThroughPreviousEditor } from "./editor-composition.ts";
-import { estimateInitialContextTokens, readCoreContextUsage } from "./context-usage.ts";
-import { isStaleExtensionContextError, shouldResetExtendedKeyboardModesOnShutdown, shouldRestoreInlineEditorCursorOnShutdown, shouldShowStartupWelcome } from "./lifecycle.ts";
-import { fetchProviderSubscriptionUsage, getSupportedSubscriptionProvider, isSubscriptionUsageEnabled, type SubscriptionUsage } from "./subscription-usage.ts";
-import { renderFixedEditorCluster } from "./fixed-editor/cluster.ts";
-import { DEFAULT_SCROLL_REPAINT_THROTTLE_MS, emergencyTerminalModeReset, TerminalSplitCompositor } from "./fixed-editor/terminal-split.ts";
-import { inlineEditorQuitCursorRestore } from "./terminal-cursor.ts";
+import { EditorPerfProfiler, readEditorPerfOptions } from "./editor-performance.ts";
+import { CoreContextUsageCache, estimateInitialContextTokens, estimateUnknownContextUsage, resolveDisplayContextUsage, type CoreContextUsage } from "./context-usage.ts";
+import { isStaleExtensionContextError, shouldShowStartupWelcome } from "./lifecycle.ts";
 import { getDefaultColors } from "./theme.ts";
+import { fetchProviderSubscriptionUsage, getSupportedSubscriptionProvider, isSubscriptionUsageEnabled, type SubscriptionUsage } from "./subscription-usage.ts";
+import { registerCdCommand } from "./cd-command.ts";
 import {
   isSupportedSuperShortcut,
   matchesConfiguredShortcut,
+  matchesCtrlSStashInput,
   matchesStashShortcutInput,
   shortcutConflictKey,
   shortcutUsesSuper,
 } from "./shortcuts.ts";
+import { PowerlineQueueStore, currentQueueContext, formatQueueDeliveryText, parseCompactQueuedPrompt } from "./queue/store.ts";
+import { canWaitAsFollowUp } from "./auto-follow-up.ts";
+import type { PowerlineQueueItem, QueueContext, QueueIntent, QueueSummary, QueueTarget } from "./queue/types.ts";
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Configuration
@@ -61,15 +64,17 @@ let config: PowerlineConfig = {
   invalidDisabledSegments: [],
   layout: null,
   invalidLayoutSegments: [],
+  separator: null,
   segmentOptions: {},
-  mouseScroll: true,
-  fixedEditor: true,
-  scrollAwayNavigationCard: false,
-  copyOnSelect: false,
   placement: "above",
   invalidPlacement: null,
+  secondaryOverflow: "drop",
+  invalidSecondaryOverflow: null,
   welcome: false,
   stashSharpSShortcut: false,
+  queue: { compactPromptMode: "queue" },
+  sendDelayMs: 0,
+  autoFollowUp: false,
 };
 
 const CUSTOM_COMPACTION_STATUS_KEY = "compact-policy";
@@ -82,108 +87,44 @@ export interface PowerlineShortcuts {
   stashHistory: ShortcutBinding;
   copyEditor: ShortcutBinding;
   cutEditor: ShortcutBinding;
-  jumpPreviousUserMessage: ShortcutBinding;
-  jumpNextUserMessage: ShortcutBinding;
-  jumpPreviousLlmMessage: ShortcutBinding;
-  jumpNextLlmMessage: ShortcutBinding;
-  jumpChatBottom: ShortcutBinding;
-  scrollChatUp: ShortcutBinding;
-  scrollChatDown: ShortcutBinding;
+  queueOpen: ShortcutBinding;
+  reply: ShortcutBinding;
   editorStart: ShortcutBinding;
   editorEnd: ShortcutBinding;
 }
 
 type PowerlineShortcutKey = keyof PowerlineShortcuts;
-type ChatJumpShortcutKey = Extract<PowerlineShortcutKey,
-  | "jumpPreviousUserMessage"
-  | "jumpNextUserMessage"
-  | "jumpPreviousLlmMessage"
-  | "jumpNextLlmMessage"
-  | "jumpChatBottom"
->;
-type ChatJumpRole = "user" | "assistant";
-type ChatJumpDirection = "previous" | "next";
-type ScrollAwayShortcutId = "bottom" | "previousUser" | "nextUser" | "previousAssistant" | "nextAssistant";
-type ChatJumpShortcutAction =
-  | { kind: "message"; role: ChatJumpRole; direction: ChatJumpDirection }
-  | { kind: "bottom" };
 type PowerlineShortcutAction =
   | { kind: "showShortcuts" }
   | { kind: "stashHistory" }
   | { kind: "copyEditor" }
   | { kind: "cutEditor" }
-  | { kind: "bashMode" }
-  | { kind: "chat"; action: ChatJumpShortcutAction };
-
+  | { kind: "queueOpen" }
+  | { kind: "reply" }
+  | { kind: "bashMode" };
 const STASH_HISTORY_LIMIT = 12;
 const PROJECT_PROMPT_HISTORY_LIMIT = 50;
+const PROJECT_PROMPT_HISTORY_FILE_LIMIT = 50;
+const PROJECT_PROMPT_HISTORY_MAX_BYTES = 3 * 1024 * 1024;
+const PROJECT_PROMPT_HISTORY_FILE_MAX_BYTES = 64 * 1024;
 const STASH_PREVIEW_WIDTH = 72;
-const DEFAULT_SHORTCUTS: Record<PowerlineShortcutKey, string> = {
+const DEFAULT_SHORTCUTS: PowerlineShortcuts = {
   showShortcuts: "ctrl+shift+k",
   stashHistory: "ctrl+alt+h",
   copyEditor: "ctrl+alt+c",
   cutEditor: "ctrl+alt+x",
-  jumpPreviousUserMessage: "ctrl+shift+u",
-  jumpNextUserMessage: "ctrl+shift+i",
-  jumpPreviousLlmMessage: "ctrl+alt+,",
-  jumpNextLlmMessage: "ctrl+alt+.",
-  jumpChatBottom: "ctrl+alt+g",
-  scrollChatUp: "super+up",
-  scrollChatDown: "super+down",
+  queueOpen: "ctrl+alt+q",
+  reply: null,
   editorStart: "super+shift+up",
   editorEnd: "super+shift+down",
 };
-const DEFAULT_BASH_MODE_SETTINGS: BashModeSettings = {
+const DEFAULT_BASH_MODE_SETTINGS = {
   toggleShortcut: "ctrl+shift+b",
+  completions: false,
   transcriptMaxLines: 2000,
   transcriptMaxBytes: 512 * 1024,
-};
-const CHAT_JUMP_SHORTCUTS: Array<{
-  shortcutKey: ChatJumpShortcutKey;
-  description: string;
-  action: ChatJumpShortcutAction;
-}> = [
-  {
-    shortcutKey: "jumpPreviousUserMessage",
-    description: "Jump to previous user message",
-    action: { kind: "message", role: "user", direction: "previous" },
-  },
-  {
-    shortcutKey: "jumpNextUserMessage",
-    description: "Jump to next user message",
-    action: { kind: "message", role: "user", direction: "next" },
-  },
-  {
-    shortcutKey: "jumpPreviousLlmMessage",
-    description: "Jump to previous LLM message",
-    action: { kind: "message", role: "assistant", direction: "previous" },
-  },
-  {
-    shortcutKey: "jumpNextLlmMessage",
-    description: "Jump to next LLM message",
-    action: { kind: "message", role: "assistant", direction: "next" },
-  },
-  {
-    shortcutKey: "jumpChatBottom",
-    description: "Jump chat to bottom",
-    action: { kind: "bottom" },
-  },
-];
-const SHORTCUT_KEYS: PowerlineShortcutKey[] = [
-  "showShortcuts",
-  "stashHistory",
-  "copyEditor",
-  "cutEditor",
-  "jumpPreviousUserMessage",
-  "jumpNextUserMessage",
-  "jumpPreviousLlmMessage",
-  "jumpNextLlmMessage",
-  "jumpChatBottom",
-  "scrollChatUp",
-  "scrollChatDown",
-  "editorStart",
-  "editorEnd",
-];
+} as const satisfies BashModeSettings;
+const SHORTCUT_KEYS: PowerlineShortcutKey[] = ["showShortcuts", "stashHistory", "copyEditor", "cutEditor", "queueOpen", "reply", "editorStart", "editorEnd"];
 const APP_RESERVED_SHORTCUTS = [
   "escape",
   "ctrl+c",
@@ -214,7 +155,7 @@ const APP_RESERVED_SHORTCUTS = [
 ] as const;
 const EXTRA_RESERVED_SHORTCUTS = ["alt+s"] as const;
 const SHORTCUT_MODIFIER_ORDER = ["ctrl", "alt", "super", "shift"] as const;
-const SHORTCUT_MODIFIERS = new Set(SHORTCUT_MODIFIER_ORDER);
+const SHORTCUT_MODIFIERS = new Set<string>(SHORTCUT_MODIFIER_ORDER);
 const SHORTCUT_NAMED_KEYS = new Set([
   "escape", "esc", "enter", "return", "tab", "space", "backspace", "delete", "insert", "clear",
   "home", "end", "pageup", "pagedown", "up", "down", "left", "right",
@@ -229,12 +170,19 @@ const STREAMING_LAYOUT_CACHE_TTL_MS = 1000;
 const STATUS_RENDER_DEBOUNCE_MS = 33;
 const CONTEXT_STATUS_RENDER_MS = 250;
 const EDITOR_STATUS_DEFER_MS = 150;
+const QUEUE_SUMMARY_CACHE_TTL_MS = 250;
 const SUBSCRIPTION_USAGE_REFRESH_MS = 2 * 60 * 1000;
 const SUBSCRIPTION_USAGE_RETRY_MS = 30 * 1000;
 const PROMPT_HISTORY_TRACKED = Symbol.for("powerlinePromptHistoryTracked");
 const PROMPT_HISTORY_STATE_KEY = Symbol.for("powerlinePromptHistoryState");
+const ACTIVE_STASH_RELOAD_STATE_KEY = Symbol.for("pi-power-user.active-stash-reload.v1");
+
+interface PromptHistoryEditor {
+  addToHistory?: (text: string) => void;
+}
 
 type PromptHistoryState = { savedPromptHistory: string[] };
+type ActiveStashReloadState = { version: 1; bySessionId: Map<string, string> };
 type SessionAssistantUsage = AssistantMessage["usage"];
 type SupportedSubscriptionProvider = NonNullable<ReturnType<typeof getSupportedSubscriptionProvider>>;
 
@@ -243,6 +191,33 @@ type CachedSubscriptionUsage = {
   fetchedAt: number;
   error?: string;
 };
+
+const activeStashReloadState = (Reflect.get(globalThis, ACTIVE_STASH_RELOAD_STATE_KEY) as ActiveStashReloadState | undefined)
+  ?? { version: 1, bySessionId: new Map<string, string>() };
+Reflect.set(globalThis, ACTIVE_STASH_RELOAD_STATE_KEY, activeStashReloadState);
+
+function getSessionId(ctx: any): string {
+  return ctx.sessionManager.getSessionId();
+}
+
+function clearActiveStashReload(ctx: any): void {
+  activeStashReloadState.bySessionId.delete(getSessionId(ctx));
+}
+
+function takeActiveStashReload(ctx: any): string | null {
+  const sessionId = getSessionId(ctx);
+  const transfers = activeStashReloadState.bySessionId;
+  const text = transfers.get(sessionId) ?? null;
+  transfers.delete(sessionId);
+  return text;
+}
+
+function transferActiveStashReload(ctx: any, text: string | null): void {
+  const transfers = activeStashReloadState.bySessionId;
+  const sessionId = getSessionId(ctx);
+  if (text === null) transfers.delete(sessionId);
+  else transfers.set(sessionId, text);
+}
 
 function getUsageTokenTotal(usage: SessionAssistantUsage): number {
   const totalTokens = "totalTokens" in usage && typeof usage.totalTokens === "number" ? usage.totalTokens : 0;
@@ -290,8 +265,9 @@ function getPromptHistoryState(): PromptHistoryState {
   return state;
 }
 
-function readPromptHistory(editor: any): string[] {
-  const history = editor?.history;
+function readPromptHistory(editor: PromptHistoryEditor | null | undefined): string[] {
+  if (!editor) return [];
+  const history = Reflect.get(editor, "history");
   if (!Array.isArray(history)) return [];
 
   const normalized: string[] = [];
@@ -307,14 +283,14 @@ function readPromptHistory(editor: any): string[] {
   return normalized;
 }
 
-function snapshotPromptHistory(editor: any): void {
+function snapshotPromptHistory(editor: PromptHistoryEditor | null | undefined): void {
   const history = readPromptHistory(editor);
   if (history.length > 0) {
     getPromptHistoryState().savedPromptHistory = [...history];
   }
 }
 
-function restorePromptHistory(editor: any): void {
+function restorePromptHistory(editor: PromptHistoryEditor | null | undefined): void {
   const { savedPromptHistory } = getPromptHistoryState();
   if (!savedPromptHistory.length || typeof editor?.addToHistory !== "function") return;
 
@@ -323,9 +299,9 @@ function restorePromptHistory(editor: any): void {
   }
 }
 
-function trackPromptHistory(editor: any): void {
+function trackPromptHistory(editor: PromptHistoryEditor | null | undefined): void {
   if (!editor || typeof editor.addToHistory !== "function") return;
-  if (editor[PROMPT_HISTORY_TRACKED]) {
+  if (Reflect.get(editor, PROMPT_HISTORY_TRACKED)) {
     snapshotPromptHistory(editor);
     return;
   }
@@ -335,7 +311,7 @@ function trackPromptHistory(editor: any): void {
     originalAddToHistory(text);
     snapshotPromptHistory(editor);
   };
-  editor[PROMPT_HISTORY_TRACKED] = true;
+  Reflect.set(editor, PROMPT_HISTORY_TRACKED, true);
   snapshotPromptHistory(editor);
 }
 
@@ -471,19 +447,56 @@ function getPromptHistoryText(content: unknown): string {
   return parts.join("\n").replace(/\s+/g, " ").trim();
 }
 
+function readFileTail(filePath: string, size: number, maxBytes: number): string {
+  const bytesToRead = Math.min(size, maxBytes);
+  if (bytesToRead === 0) {
+    return "";
+  }
+
+  const fd = openSync(filePath, "r");
+  try {
+    const buffer = Buffer.allocUnsafe(bytesToRead);
+    const bytesRead = readSync(fd, buffer, 0, bytesToRead, size - bytesToRead);
+    const text = buffer.toString("utf8", 0, bytesRead);
+    if (size <= bytesToRead) {
+      return text;
+    }
+
+    const firstNewline = text.indexOf("\n");
+    return firstNewline === -1 ? "" : text.slice(firstNewline + 1);
+  } finally {
+    closeSync(fd);
+  }
+}
+
 function readRecentProjectPrompts(cwd: string, limit: number): string[] {
   const sessionsPath = getProjectSessionsPath(cwd);
   if (!existsSync(sessionsPath)) {
     return [];
   }
 
-  const promptEntries: { text: string; timestamp: number }[] = [];
-  const fileNames = readdirSync(sessionsPath)
-    .filter((fileName) => fileName.endsWith(".jsonl"));
+  const files = readdirSync(sessionsPath)
+    .filter((fileName) => fileName.endsWith(".jsonl"))
+    .map((fileName) => {
+      const filePath = join(sessionsPath, fileName);
+      const stats = statSync(filePath);
+      return { fileName, filePath, mtimeMs: stats.mtimeMs, size: stats.size };
+    })
+    .sort((a, b) => b.mtimeMs - a.mtimeMs || b.fileName.localeCompare(a.fileName))
+    .slice(0, PROJECT_PROMPT_HISTORY_FILE_LIMIT);
 
-  for (const fileName of fileNames) {
-    const filePath = join(sessionsPath, fileName);
-    const lines = readFileSync(filePath, "utf-8").split("\n");
+  const prompts: string[] = [];
+  const seen = new Set<string>();
+  let remainingBytes = PROJECT_PROMPT_HISTORY_MAX_BYTES;
+
+  for (const file of files) {
+    if (remainingBytes <= 0) {
+      break;
+    }
+
+    const bytesToRead = Math.min(file.size, PROJECT_PROMPT_HISTORY_FILE_MAX_BYTES, remainingBytes);
+    remainingBytes -= bytesToRead;
+    const lines = readFileTail(file.filePath, file.size, bytesToRead).split("\n");
 
     for (let i = lines.length - 1; i >= 0; i--) {
       const line = lines[i];
@@ -496,7 +509,7 @@ function readRecentProjectPrompts(cwd: string, limit: number): string[] {
         entry = JSON.parse(line);
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
-        throw new Error(`Failed to parse session file ${filePath}: ${message}`, { cause: error });
+        throw new Error(`Failed to parse session file ${file.filePath}: ${message}`, { cause: error });
       }
 
       if (!isRecord(entry) || entry.type !== "message" || !isRecord(entry.message) || entry.message.role !== "user") {
@@ -508,29 +521,15 @@ function readRecentProjectPrompts(cwd: string, limit: number): string[] {
         continue;
       }
 
-      const timestamp = typeof entry.message.timestamp === "number"
-        ? entry.message.timestamp
-        : typeof entry.timestamp === "string"
-          ? Date.parse(entry.timestamp)
-          : 0;
+      if (seen.has(text)) {
+        continue;
+      }
 
-      promptEntries.push({ text, timestamp: Number.isFinite(timestamp) ? timestamp : 0 });
-    }
-  }
-
-  promptEntries.sort((a, b) => b.timestamp - a.timestamp);
-
-  const prompts: string[] = [];
-  const seen = new Set<string>();
-  for (const entry of promptEntries) {
-    if (seen.has(entry.text)) {
-      continue;
-    }
-
-    seen.add(entry.text);
-    prompts.push(entry.text);
-    if (prompts.length >= limit) {
-      return prompts;
+      seen.add(text);
+      prompts.push(text);
+      if (prompts.length >= limit) {
+        return prompts;
+      }
     }
   }
 
@@ -639,7 +638,7 @@ function writePowerlinePresetSetting(preset: StatusLinePreset, cwd: string = pro
 
 function writePowerlineOptionSetting(
   cwd: string,
-  updates: Partial<Pick<PowerlineConfig, "mouseScroll" | "fixedEditor" | "scrollAwayNavigationCard" | "welcome" | "stashSharpSShortcut" | "placement">>,
+  updates: Partial<Pick<PowerlineConfig, "welcome" | "stashSharpSShortcut" | "placement">>,
   currentPreset: StatusLinePreset,
 ): boolean {
   return writePowerlineSetting(cwd, (existingPowerlineSetting) => (
@@ -694,7 +693,7 @@ function normalizeShortcut(value: string): string {
   const parts = value.trim().toLowerCase().split("+");
   if (parts.length <= 1) return parts[0] ?? "";
 
-  const modifierRank = new Map(SHORTCUT_MODIFIER_ORDER.map((modifier, index) => [modifier, index]));
+  const modifierRank = new Map<string, number>(SHORTCUT_MODIFIER_ORDER.map((modifier, index) => [modifier, index]));
   const modifiers = parts.slice(0, -1).sort((a, b) => (modifierRank.get(a) ?? 99) - (modifierRank.get(b) ?? 99));
   return [...modifiers, parts[parts.length - 1]].join("+");
 }
@@ -703,23 +702,13 @@ function formatShortcutLabel(shortcut: ShortcutBinding): string | null {
   return shortcut?.split("+").map((part) => part.toLowerCase() === "super" ? "cmd" : part).join("+") ?? null;
 }
 
-function scrollAwayShortcutEntry(id: ScrollAwayShortcutId, shortcut: ShortcutBinding): { id: ScrollAwayShortcutId; shortcutLabel: string } | null {
-  const shortcutLabel = formatShortcutLabel(shortcut);
-  return shortcutLabel ? { id, shortcutLabel } : null;
-}
-
 const POWERLINE_SHORTCUT_HELP: ReadonlyArray<{ key: PowerlineShortcutKey; label: string }> = [
   { key: "showShortcuts", label: "Show Powerline shortcuts" },
   { key: "stashHistory", label: "Open prompt history" },
   { key: "copyEditor", label: "Copy editor text" },
   { key: "cutEditor", label: "Cut editor text" },
-  { key: "scrollChatUp", label: "Scroll chat up" },
-  { key: "scrollChatDown", label: "Scroll chat down" },
-  { key: "jumpPreviousUserMessage", label: "Previous user message" },
-  { key: "jumpNextUserMessage", label: "Next user message" },
-  { key: "jumpPreviousLlmMessage", label: "Previous assistant response" },
-  { key: "jumpNextLlmMessage", label: "Next assistant response" },
-  { key: "jumpChatBottom", label: "Jump chat to bottom" },
+  { key: "queueOpen", label: "Open prompt queue" },
+  { key: "reply", label: "Quote a previous message" },
   { key: "editorStart", label: "Move editor to start" },
   { key: "editorEnd", label: "Move editor to end" },
 ];
@@ -954,45 +943,20 @@ function parseShortcutSetting(value: unknown): ShortcutBinding | undefined {
   return parseShortcutOverride(value) ?? undefined;
 }
 
-function fixedEditorScrollAliasUsageKey(shortcut: string): "super+up" | "super+down" | null {
-  switch (normalizeShortcut(shortcut)) {
-    case "super+up":
-    case "super+home":
-    case "super+pageup":
-    case "ctrl+shift+up":
-    case "pageup":
-      return "super+up";
-    case "super+down":
-    case "super+end":
-    case "super+pagedown":
-    case "ctrl+shift+down":
-    case "pagedown":
-      return "super+down";
-    default:
-      return null;
-  }
-}
-
-function conflictsWithEnabledScrollAlias(key: PowerlineShortcutKey, shortcut: string, resolved: PowerlineShortcuts): boolean {
-  const usageKey = fixedEditorScrollAliasUsageKey(shortcut);
-  return (key !== "scrollChatUp" && resolved.scrollChatUp !== null && usageKey === "super+up")
-    || (key !== "scrollChatDown" && resolved.scrollChatDown !== null && usageKey === "super+down");
-}
-
-function findShortcutReplacement(key: PowerlineShortcutKey, used: Set<string>, resolved: PowerlineShortcuts): string | null {
+function findShortcutReplacement(key: PowerlineShortcutKey, used: Set<string>): string | null {
   const preferred = DEFAULT_SHORTCUTS[key];
-  if (!used.has(shortcutUsageKey(preferred)) && !conflictsWithEnabledScrollAlias(key, preferred, resolved)) {
+  if (preferred && !used.has(shortcutUsageKey(preferred))) {
     return preferred;
   }
-
-  for (const shortcutKey of SHORTCUT_KEYS) {
-    const candidate = DEFAULT_SHORTCUTS[shortcutKey];
-    if (!used.has(shortcutUsageKey(candidate)) && !conflictsWithEnabledScrollAlias(key, candidate, resolved)) {
-      return candidate;
-    }
-  }
-
   return null;
+}
+
+function shortcutBelongsToOtherDefault(key: PowerlineShortcutKey, shortcut: string): boolean {
+  const usageKey = shortcutUsageKey(shortcut);
+  return SHORTCUT_KEYS.some((shortcutKey) => {
+    const defaultShortcut = DEFAULT_SHORTCUTS[shortcutKey];
+    return shortcutKey !== key && defaultShortcut !== null && shortcutUsageKey(defaultShortcut) === usageKey;
+  });
 }
 
 function bashToggleShortcutReservation(settings: Record<string, unknown>): ShortcutBinding {
@@ -1036,14 +1000,15 @@ export function resolveShortcutConfig(settings: Record<string, unknown>): Powerl
 
     const configuredUsageKey = shortcutUsageKey(configured);
 
-    if (!used.has(configuredUsageKey) && !conflictsWithEnabledScrollAlias(key, configured, resolved)) {
+    if (!used.has(configuredUsageKey) && !shortcutBelongsToOtherDefault(key, configured)) {
       used.add(configuredUsageKey);
       continue;
     }
 
-    const replacement = findShortcutReplacement(key, used, resolved);
+    const replacement = findShortcutReplacement(key, used);
     if (!replacement) {
       console.debug(`[pi-power-user] Shortcut conflict for ${key}: "${configured}" is already in use`);
+      resolved[key] = null;
       continue;
     }
 
@@ -1079,7 +1044,6 @@ export function parseBashModeSettings(settings: Record<string, unknown>, powerli
     ? null
     : configuredToggleShortcut
       && !used.has(shortcutUsageKey(configuredToggleShortcut))
-      && (!powerlineShortcuts || !conflictsWithEnabledScrollAlias("stashHistory", configuredToggleShortcut, powerlineShortcuts))
       ? configuredToggleShortcut
       : fallbackToggleShortcut;
 
@@ -1088,6 +1052,9 @@ export function parseBashModeSettings(settings: Record<string, unknown>, powerli
       `[pi-power-user] Bash mode shortcut conflict: "${configuredToggleShortcut}" replaced with "${toggleShortcut ?? "disabled"}"`,
     );
   }
+  const completions = typeof raw.completions === "boolean"
+    ? raw.completions
+    : DEFAULT_BASH_MODE_SETTINGS.completions;
   const transcriptMaxLines = typeof raw.transcriptMaxLines === "number" && Number.isFinite(raw.transcriptMaxLines)
     ? Math.max(100, Math.floor(raw.transcriptMaxLines))
     : DEFAULT_BASH_MODE_SETTINGS.transcriptMaxLines;
@@ -1097,9 +1064,177 @@ export function parseBashModeSettings(settings: Record<string, unknown>, powerli
 
   return {
     toggleShortcut,
+    completions,
     transcriptMaxLines,
     transcriptMaxBytes,
   };
+}
+
+const FAST_EDITOR_RENDER_LINE_THRESHOLD = 80;
+const FAST_EDITOR_RENDER_COLUMN_THRESHOLD = 1200;
+
+interface FastEditorState {
+  lines: string[];
+  cursorLine: number;
+  cursorCol: number;
+}
+
+interface FastEditorVisualLine {
+  text: string;
+  cursorCol?: number;
+}
+
+function readFastEditorState(editor: unknown): FastEditorState | null {
+  const state = Reflect.get(editor as object, "state");
+  if (!isRecord(state) || !Array.isArray(state.lines)) return null;
+  if (typeof state.cursorLine !== "number" || typeof state.cursorCol !== "number") return null;
+
+  const lines = state.lines as string[];
+  const cursorLine = Math.max(0, Math.min(lines.length - 1, Math.floor(state.cursorLine)));
+  const cursorText = lines[cursorLine] ?? "";
+  if (typeof cursorText !== "string") return null;
+  const cursorCol = Math.max(0, Math.min(cursorText.length, Math.floor(state.cursorCol)));
+  return { lines, cursorLine, cursorCol };
+}
+
+function fastChunkCount(line: string, width: number): number {
+  return Math.max(1, Math.ceil(Math.max(1, line.length) / width));
+}
+
+function fastChunk(line: string, width: number, chunkIndex: number): { text: string; startCol: number } {
+  const startCol = chunkIndex * width;
+  return { text: line.slice(startCol, startCol + width), startCol };
+}
+
+function isFastRenderableText(text: string): boolean {
+  return /^[\x20-\x7E]*$/.test(text);
+}
+
+function pushTrailingChunks(target: FastEditorVisualLine[], line: string, width: number, maxCount: number): void {
+  const count = fastChunkCount(line, width);
+  const start = Math.max(0, count - maxCount);
+  for (let index = start; index < count; index++) {
+    target.push({ text: fastChunk(line, width, index).text });
+  }
+}
+
+function collectFastEditorVisualLines(state: FastEditorState, layoutWidth: number, maxVisibleLines: number): {
+  lines: FastEditorVisualLine[];
+  hasBefore: boolean;
+  hasAfter: boolean;
+} {
+  const cursorText = state.lines[state.cursorLine] ?? "";
+  const cursorChunkIndex = Math.floor(state.cursorCol / layoutWidth);
+  const cursorChunkCount = Math.max(fastChunkCount(cursorText, layoutWidth), cursorChunkIndex + 1);
+  const firstCursorChunk = Math.max(0, cursorChunkIndex - maxVisibleLines + 1);
+
+  const visualLines: FastEditorVisualLine[] = [];
+  for (let lineIndex = state.cursorLine - 1; lineIndex >= 0 && visualLines.length < maxVisibleLines - 1; lineIndex--) {
+    const chunks: FastEditorVisualLine[] = [];
+    pushTrailingChunks(chunks, state.lines[lineIndex] ?? "", layoutWidth, maxVisibleLines - 1 - visualLines.length);
+    visualLines.unshift(...chunks);
+  }
+
+  for (let chunkIndex = firstCursorChunk; chunkIndex < cursorChunkIndex && visualLines.length < maxVisibleLines - 1; chunkIndex++) {
+    visualLines.push({ text: fastChunk(cursorText, layoutWidth, chunkIndex).text });
+  }
+
+  const cursorChunk = fastChunk(cursorText, layoutWidth, cursorChunkIndex);
+  visualLines.push({
+    text: cursorChunk.text,
+    cursorCol: state.cursorCol - cursorChunk.startCol,
+  });
+
+  for (let chunkIndex = cursorChunkIndex + 1; chunkIndex < cursorChunkCount && visualLines.length < maxVisibleLines; chunkIndex++) {
+    visualLines.push({ text: fastChunk(cursorText, layoutWidth, chunkIndex).text });
+  }
+
+  for (let lineIndex = state.cursorLine + 1; lineIndex < state.lines.length && visualLines.length < maxVisibleLines; lineIndex++) {
+    const line = state.lines[lineIndex] ?? "";
+    const count = fastChunkCount(line, layoutWidth);
+    for (let chunkIndex = 0; chunkIndex < count && visualLines.length < maxVisibleLines; chunkIndex++) {
+      visualLines.push({ text: fastChunk(line, layoutWidth, chunkIndex).text });
+    }
+  }
+
+  return {
+    lines: visualLines.slice(-maxVisibleLines),
+    hasBefore: state.cursorLine > 0 || firstCursorChunk > 0,
+    hasAfter: state.cursorLine < state.lines.length - 1 || cursorChunkIndex < cursorChunkCount - 1,
+  };
+}
+
+function renderFastCursorLine(line: string, cursorCol: number, focused: boolean): string {
+  const before = line.slice(0, cursorCol);
+  const target = line[cursorCol];
+  const marker = focused ? CURSOR_MARKER : "";
+  if (target) {
+    return `${before}${marker}\x1b[7m${target}\x1b[0m${line.slice(cursorCol + target.length)}`;
+  }
+  return `${before}${marker}\x1b[7m \x1b[0m`;
+}
+
+function padToWidth(line: string, width: number): string {
+  return `${line}${" ".repeat(Math.max(0, width - visibleWidth(line)))}`;
+}
+
+export function colorEditorBorder(editor: unknown, text: string): string {
+  const borderColor = editor && typeof editor === "object"
+    ? Reflect.get(editor, "borderColor")
+    : undefined;
+  return typeof borderColor === "function"
+    ? borderColor.call(editor, text)
+    : `${getFgAnsiCode("sep")}${text}${ansi.reset}`;
+}
+
+export function renderFastPowerlineEditor(
+  editor: unknown,
+  width: number,
+  options: { bashModeActive: boolean; completionsEnabled: boolean },
+): string[] | null {
+  if (width < 10 || options.completionsEnabled) return null;
+  if (Reflect.get(editor as object, "isInPaste") === true || Reflect.get(editor as object, "jumpMode") != null) return null;
+  if (Reflect.get(editor as object, "autocompleteState") != null) return null;
+
+  const isShowingAutocomplete = Reflect.get(editor as object, "isShowingAutocomplete");
+  if (typeof isShowingAutocomplete === "function" && isShowingAutocomplete.call(editor)) return null;
+
+  const state = readFastEditorState(editor);
+  if (!state) return null;
+
+  const cursorText = state.lines[state.cursorLine] ?? "";
+  if (state.lines.length < FAST_EDITOR_RENDER_LINE_THRESHOLD && cursorText.length < FAST_EDITOR_RENDER_COLUMN_THRESHOLD) {
+    return null;
+  }
+
+  const terminalRows = Reflect.get(Reflect.get(editor as object, "tui") ?? {}, "terminal")?.rows;
+  const maxVisibleLines = Math.max(5, Math.floor((typeof terminalRows === "number" ? terminalRows : 24) * 0.3));
+  const innerWidth = Math.max(1, width - 3);
+  const layoutWidth = Math.max(1, innerWidth - 1);
+  const viewport = collectFastEditorVisualLines(state, layoutWidth, maxVisibleLines);
+  if (viewport.lines.some((line) => !isFastRenderableText(line.text))) return null;
+
+  Reflect.set(editor as object, "lastWidth", layoutWidth);
+
+  const border = (marker: "↑" | "↓" | "─") => {
+    const text = marker === "─" ? "─".repeat(width - 2) : `${marker}${"─".repeat(Math.max(0, width - 3))}`;
+    return ` ${colorEditorBorder(editor, text)}`;
+  };
+  const promptGlyph = options.bashModeActive ? "$" : ">";
+  const prompt = `${ansi.getFgAnsi(200, 200, 200)}${promptGlyph}${ansi.reset}`;
+  const promptPrefix = ` ${prompt} `;
+  const contPrefix = "   ";
+
+  const lines = [border(viewport.hasBefore ? "↑" : "─")];
+  for (let index = 0; index < viewport.lines.length; index++) {
+    const visual = viewport.lines[index]!;
+    const content = visual.cursorCol === undefined
+      ? visual.text
+      : renderFastCursorLine(visual.text, visual.cursorCol, Reflect.get(editor as object, "focused") === true);
+    lines.push(`${index === 0 ? promptPrefix : contPrefix}${padToWidth(content, innerWidth)}`);
+  }
+  lines.push(border(viewport.hasAfter ? "↓" : "─"));
+  return lines;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1130,29 +1265,24 @@ function buildContentFromParts(
   return " " + parts.join(` ${sepAnsi}${sep}${ansi.reset} `) + ansi.reset + " ";
 }
 
+type ResponsiveLayout = { topContent: string; secondaryLines: string[] };
+
 /**
  * Responsive segment layout - fits segments into top bar, overflows to secondary row.
  * When terminal is wide enough, secondary segments move up to top bar.
  * When narrow, top bar segments overflow down to secondary row.
+ * With `secondaryOverflow: "wrap"`, secondary overflow continues on additional rows.
  */
 function computeResponsiveLayout(
   ctx: SegmentContext,
   presetDef: ReturnType<typeof getPreset>,
+  allSegmentIds: StatusLineSegmentId[],
   availableWidth: number
-): { topContent: string; secondaryContent: string } {
+): ResponsiveLayout {
   const separatorStyle = config.separator ?? presetDef.separator;
   const separatorDef = getSeparator(separatorStyle);
   const sepWidth = visibleWidth(separatorDef.left) + 2; // separator + spaces around it
-  
-  // Get all segments: primary first, then secondary
-  const mergedSegments = mergeSegmentsWithCustomItems(presetDef, config.customItems, {
-    layout: config.layout,
-    disabledSegments: config.disabledSegments,
-  });
-  const primaryIds = [...mergedSegments.leftSegments, ...mergedSegments.rightSegments];
-  const secondaryIds = mergedSegments.secondarySegments;
-  const allSegmentIds = [...primaryIds, ...secondaryIds];
-  
+
   // Render all segments and get their widths
   const renderedSegments: { content: string; width: number }[] = [];
   for (const segId of allSegmentIds) {
@@ -1161,11 +1291,11 @@ function computeResponsiveLayout(
       renderedSegments.push({ content, width });
     }
   }
-  
+
   if (renderedSegments.length === 0) {
-    return { topContent: "", secondaryContent: "" };
+    return { topContent: "", secondaryLines: [] };
   }
-  
+
   // Calculate how many segments fit in top bar
   // Account for: leading space (1) + trailing space (1) = 2 chars overhead
   const baseOverhead = 2;
@@ -1173,10 +1303,10 @@ function computeResponsiveLayout(
   let topSegments: string[] = [];
   let overflowSegments: { content: string; width: number }[] = [];
   let overflow = false;
-  
+
   for (const seg of renderedSegments) {
     const neededWidth = seg.width + (topSegments.length > 0 ? sepWidth : 0);
-    
+
     if (!overflow && currentWidth + neededWidth <= availableWidth) {
       topSegments.push(seg.content);
       currentWidth += neededWidth;
@@ -1185,25 +1315,34 @@ function computeResponsiveLayout(
       overflowSegments.push(seg);
     }
   }
-  
-  // Fit overflow segments into secondary row (same width constraint)
-  // Stop at first non-fitting segment to preserve ordering
+
+  // Fit overflow segments into secondary rows (same width constraint).
+  // Drop mode stops at the first non-fitting segment to preserve ordering.
+  // Wrap mode starts a new row instead, skipping segments too wide for any row.
+  const wrap = config.secondaryOverflow === "wrap";
+  const secondaryRows: string[][] = [[]];
   let secondaryWidth = baseOverhead;
-  let secondarySegments: string[] = [];
-  
+
   for (const seg of overflowSegments) {
-    const neededWidth = seg.width + (secondarySegments.length > 0 ? sepWidth : 0);
-    if (secondaryWidth + neededWidth <= availableWidth) {
-      secondarySegments.push(seg.content);
-      secondaryWidth += neededWidth;
-    } else {
-      break;
+    let row = secondaryRows[secondaryRows.length - 1]!;
+    let neededWidth = seg.width + (row.length > 0 ? sepWidth : 0);
+    if (secondaryWidth + neededWidth > availableWidth) {
+      if (!wrap) break;
+      if (baseOverhead + seg.width > availableWidth) continue;
+      row = [];
+      secondaryRows.push(row);
+      secondaryWidth = baseOverhead;
+      neededWidth = seg.width;
     }
+    row.push(seg.content);
+    secondaryWidth += neededWidth;
   }
-  
+
   return {
     topContent: buildContentFromParts(topSegments, separatorStyle),
-    secondaryContent: buildContentFromParts(secondarySegments, separatorStyle),
+    secondaryLines: secondaryRows
+      .filter((row) => row.length > 0)
+      .map((row) => buildContentFromParts(row, separatorStyle)),
   };
 }
 
@@ -1231,9 +1370,16 @@ function warnInvalidSegmentSettings(ctx: any): void {
     console.warn(`[pi-power-user] ${message}`);
     if (ctx.hasUI) ctx.ui.notify(message, "warning");
   }
+
+  if (config.invalidSecondaryOverflow !== null) {
+    const message = `Ignoring invalid powerline secondaryOverflow: ${JSON.stringify(config.invalidSecondaryOverflow)}`;
+    console.warn(`[pi-power-user] ${message}`);
+    if (ctx.hasUI) ctx.ui.notify(message, "warning");
+  }
 }
 
 export default function powerlineFooter(pi: ExtensionAPI) {
+  const editorPerf = new EditorPerfProfiler(readEditorPerfOptions());
   const startupSettings = readSettings();
   config = parsePowerlineConfig(startupSettings.powerline, PRESET_NAMES);
   let resolvedShortcuts = resolveShortcutConfig(startupSettings);
@@ -1244,25 +1390,30 @@ export default function powerlineFooter(pi: ExtensionAPI) {
   let sessionGeneration = 0;
   let currentCtx: any = null;
   let footerDataRef: ReadonlyFooterDataProvider | null = null;
+  let footerDataCwd: string | null = null;
   let getThinkingLevelFn: (() => string) | null = null;
   let currentThinkingLevel: string | null = null;
   let liveAssistantUsage: SessionAssistantUsage | null = null;
   let subscriptionUsageByProvider = new Map<SupportedSubscriptionProvider, CachedSubscriptionUsage>();
   let subscriptionUsageInflight = new Map<SupportedSubscriptionProvider, Promise<void>>();
+  let approximateContextUsage: CoreContextUsage | null = null;
   let isStreaming = false;
   let tuiRef: any = null;
   let restoreFooterStatusRepaintHook: (() => void) | null = null;
-  let fixedEditorCompositor: TerminalSplitCompositor | null = null;
-  let fixedStatusContainer: any = null;
-  let fixedEditorContainer: any = null;
-  let fixedWidgetContainerAbove: any = null;
-  let fixedWidgetContainerBelow: any = null;
   let stashShortcutInputUnsubscribe: (() => void) | null = null;
   let dismissWelcomeOverlay: (() => void) | null = null;
   let welcomeHeaderActive = false;
-  let welcomeOverlayShouldDismiss = false;
+  let welcomeRequest: AbortController | null = null;
+  let welcomeTimer: ReturnType<typeof setTimeout> | null = null;
   let lastUserPrompt = "";
   let showLastPrompt = true;
+  let lastPromptRenderCache: {
+    source: string;
+    compact: string;
+    width: number;
+    color: string;
+    lines: string[];
+  } | null = null;
   let stashedEditorText: string | null = null;
   let stashedPromptHistory: string[] = readPersistedStashHistory();
   let currentEditor: any = null;
@@ -1270,10 +1421,30 @@ export default function powerlineFooter(pi: ExtensionAPI) {
   let bashTranscript = new BashTranscriptStore(bashModeSettings);
   let bashCompletionEngine = new BashCompletionEngine();
   let shellSession: ManagedShellSession | null = null;
-  
+  const queueStore = new PowerlineQueueStore();
+  let queueSummaryCache: {
+    cwd: string;
+    sessionId?: string;
+    compacting: boolean;
+    expiresAt: number;
+    summary: QueueSummary;
+  } | null = null;
+  let powerlineCompacting = false;
+  let compactionGeneration = 0;
+  let pendingSend: {
+    text: string;
+    submit: (text: string) => unknown;
+    deadline: number;
+    timer: ReturnType<typeof setTimeout>;
+    ticker: ReturnType<typeof setInterval>;
+  } | null = null;
+  let postCompactionDelivery: { generation: number; context: QueueContext } | null = null;
+  let queueDeliveryTimer: ReturnType<typeof setTimeout> | null = null;
+  const pendingQueueDeliveries = new Map<string, { text: string; timer: ReturnType<typeof setTimeout> }>();
+
   // Cache for the top and secondary powerline widgets.
   let lastLayoutWidth = 0;
-  let lastLayoutResult: { topContent: string; secondaryContent: string } | null = null;
+  let lastLayoutResult: ResponsiveLayout | null = null;
   let lastLayoutTimestamp = 0;
   let layoutDirty = true;
   let forceNextLayoutRecompute = false;
@@ -1282,16 +1453,12 @@ export default function powerlineFooter(pi: ExtensionAPI) {
   // Cache for token counting: avoid re-scanning the full session event list
   // on every render (250ms-1s cadence). Revalidates the trailing event's
   // stats signature so in-place streaming updates are not served stale.
+  const sessionBranchCache = new SessionBranchCache();
   const tokenStatsCache = new SessionTokenStatsCache();
+  const coreContextUsageCache = new CoreContextUsageCache();
 
   const getShellPath = () => process.env.SHELL || "/bin/sh";
   const getShellCwd = () => shellSession?.state.cwd ?? currentCtx?.cwd ?? process.cwd();
-  const welcomeDismissScheduler = createWelcomeDismissScheduler({
-    dismiss: (ctx: unknown) => dismissWelcome(ctx),
-    getGeneration: () => sessionGeneration,
-    isEnabled: () => enabled,
-  });
-
   const statusRenderScheduler = createRenderScheduler(() => {
     const msSinceInput = Date.now() - lastEditorInputAt;
     if (layoutDirty && !forceNextLayoutRecompute && msSinceInput < EDITOR_STATUS_DEFER_MS) {
@@ -1305,7 +1472,9 @@ export default function powerlineFooter(pi: ExtensionAPI) {
   const resetLayoutCache = () => {
     lastLayoutResult = null;
     layoutDirty = true;
+    sessionBranchCache.reset();
     tokenStatsCache.reset();
+    coreContextUsageCache.reset();
   };
 
   const requestStatusRender = (delayMs?: number) => {
@@ -1362,7 +1531,7 @@ export default function powerlineFooter(pi: ExtensionAPI) {
   const ensureSubscriptionUsage = (ctx: any) => {
     const model = ctx?.model;
     const provider = getSupportedSubscriptionProvider(model);
-    if (!isSubscriptionUsageEnabled(provider, ctx?.modelRegistry?.isUsingOAuth?.(model) ?? false)) {
+    if (!provider || !isSubscriptionUsageEnabled(provider, ctx?.modelRegistry?.isUsingOAuth?.(model) ?? false)) {
       return;
     }
 
@@ -1496,7 +1665,7 @@ export default function powerlineFooter(pi: ExtensionAPI) {
     items: SelectItem[],
     maxVisible: number,
   ): Promise<SelectItem | null> {
-    return ctx.ui.custom<SelectItem | null>(
+    return ctx.ui.custom(
       (tui: any, theme: Theme, _keybindings: any, done: (result: SelectItem | null) => void) => {
         const selectList = new SelectList(items, maxVisible, overlaySelectListTheme(theme));
         const border = (text: string) => theme.fg("dim", text);
@@ -1543,6 +1712,352 @@ export default function powerlineFooter(pi: ExtensionAPI) {
     );
   }
 
+  function getQueueSessionId(ctx: any): string | undefined {
+    const sessionId = ctx.sessionManager?.getSessionId?.();
+    return typeof sessionId === "string" && sessionId.trim() ? sessionId : undefined;
+  }
+
+  function getQueueContext(ctx: any): QueueContext {
+    return currentQueueContext(ctx.cwd ?? process.cwd(), getQueueSessionId(ctx));
+  }
+
+  function getQueueSummary(ctx: any): QueueSummary {
+    const context = getQueueContext(ctx);
+    const now = Date.now();
+    if (
+      queueSummaryCache
+      && queueSummaryCache.cwd === context.cwd
+      && queueSummaryCache.sessionId === context.sessionId
+      && queueSummaryCache.compacting === powerlineCompacting
+      && now < queueSummaryCache.expiresAt
+    ) {
+      return queueSummaryCache.summary;
+    }
+
+    const summary = queueStore.summarize(context, powerlineCompacting);
+    queueSummaryCache = {
+      cwd: context.cwd,
+      ...(context.sessionId ? { sessionId: context.sessionId } : {}),
+      compacting: powerlineCompacting,
+      expiresAt: now + QUEUE_SUMMARY_CACHE_TTL_MS,
+      summary,
+    };
+    return summary;
+  }
+
+  function requestQueueRender(): void {
+    queueSummaryCache = null;
+    requestImmediateStatusRender({ deferDuringTyping: false });
+  }
+
+  function queueItemLabel(item: PowerlineQueueItem): string {
+    const status = item.status === "queued" ? item.intent : `${item.intent}/${item.status}`;
+    return `${item.id} ${status} ${buildStashPreview(item.text, 56)}`;
+  }
+
+  function queueItemDescription(item: PowerlineQueueItem): string {
+    if (item.target.kind === "global") return "global";
+    if (item.target.kind === "current-session") return "current session";
+    return item.target.alias ? `@${item.target.alias}` : item.target.cwd;
+  }
+
+  function captureQueueItem(ctx: any, text: string, intent: QueueIntent, target: QueueTarget): PowerlineQueueItem {
+    const item = queueStore.add({
+      text,
+      intent,
+      target,
+      source: getQueueContext(ctx),
+    });
+    requestQueueRender();
+    return item;
+  }
+
+  function capturePostCompactPrompt(ctx: any, text: string): PowerlineQueueItem | null {
+    const trimmed = text.trim();
+    if (!trimmed) return null;
+
+    const item = captureQueueItem(ctx, trimmed, "post-compact", { kind: "current-session" });
+    ctx.ui.notify(`Queued for after compaction (${item.id})`, "info");
+    return item;
+  }
+
+  function takePendingSend(): NonNullable<typeof pendingSend> | null {
+    const pending = pendingSend;
+    if (!pending) return null;
+    pendingSend = null;
+    clearTimeout(pending.timer);
+    clearInterval(pending.ticker);
+    tuiRef?.requestRender();
+    return pending;
+  }
+
+  function sendPendingNow(): void {
+    const pending = takePendingSend();
+    if (!pending) return;
+    // Mirror the editor's compaction capture so a delayed prompt never lands in Pi's native compaction queue.
+    if (powerlineCompacting && currentCtx) {
+      currentEditor?.addToHistory?.(pending.text);
+      capturePostCompactPrompt(currentCtx, pending.text);
+      return;
+    }
+    void pending.submit(pending.text);
+  }
+
+  function restorePendingSend(): void {
+    const pending = takePendingSend();
+    if (!pending) return;
+    // setText drops paste markers, so a draft typed during the countdown is kept in expanded form.
+    const draft = currentEditor.getExpandedText();
+    currentEditor.setText(draft.trim() ? `${pending.text}\n\n${draft}` : pending.text);
+  }
+
+  function submitWithDelay(text: string, submit: (text: string) => unknown): void {
+    const trimmed = text.trim();
+    if (!trimmed) {
+      sendPendingNow();
+      return;
+    }
+    if (config.sendDelayMs <= 0 || trimmed.startsWith("/") || trimmed.startsWith("!")) {
+      void submit(text);
+      return;
+    }
+    sendPendingNow();
+    pendingSend = {
+      text: trimmed,
+      submit,
+      deadline: Date.now() + config.sendDelayMs,
+      timer: setTimeout(sendPendingNow, config.sendDelayMs),
+      ticker: setInterval(() => tuiRef?.requestRender(), 1000),
+    };
+    tuiRef?.requestRender();
+  }
+
+  function deliveryModeForItem(ctx: any, item: PowerlineQueueItem): "steer" | "followUp" | undefined {
+    const idle = typeof ctx.isIdle === "function" ? ctx.isIdle() : true;
+    if (idle) return undefined;
+    return item.intent === "steer" ? "steer" : "followUp";
+  }
+
+  function clearPendingQueueDelivery(id: string): void {
+    const pending = pendingQueueDeliveries.get(id);
+    if (!pending) return;
+    clearTimeout(pending.timer);
+    pendingQueueDeliveries.delete(id);
+  }
+
+  function trackPendingQueueDelivery(item: PowerlineQueueItem, text: string): void {
+    clearPendingQueueDelivery(item.id);
+    const timer = setTimeout(() => {
+      pendingQueueDeliveries.delete(item.id);
+      const current = queueStore.get(item.id);
+      if (current?.status === "delivering") {
+        queueStore.update(item.id, { status: "queued", error: "Queued message did not start" });
+        requestQueueRender();
+      }
+    }, 60_000);
+    pendingQueueDeliveries.set(item.id, { text, timer });
+  }
+
+  function requeuePendingQueueDeliveries(error: string): void {
+    for (const id of [...pendingQueueDeliveries.keys()]) {
+      clearPendingQueueDelivery(id);
+      const current = queueStore.get(id);
+      if (current?.status === "delivering") {
+        queueStore.update(id, { status: "queued", error });
+      }
+    }
+  }
+
+  function finishPendingQueueDelivery(text: string, ctx: any): void {
+    const normalized = text.replace(/\s+/g, " ").trim();
+    for (const [id, pending] of pendingQueueDeliveries) {
+      if (pending.text.replace(/\s+/g, " ").trim() !== normalized) continue;
+      clearPendingQueueDelivery(id);
+      const updated = queueStore.update(id, { status: "sent", error: undefined });
+      if (!updated) return;
+      try {
+        ctx.ui.notify(`Sent queued item ${id}`, "info");
+      } catch (error) {
+        if (!isStaleExtensionContextError(error)) throw error;
+        currentCtx = null;
+      }
+      requestQueueRender();
+      return;
+    }
+  }
+
+  function deliverQueueItem(ctx: any, item: PowerlineQueueItem): boolean {
+    if (powerlineCompacting) {
+      queueStore.update(item.id, { status: "queued" });
+      requestQueueRender();
+      return false;
+    }
+
+    queueStore.update(item.id, { status: "delivering", error: undefined });
+    requestQueueRender();
+
+    try {
+      const deliverAs = deliveryModeForItem(ctx, item);
+      const deliveryText = formatQueueDeliveryText(item);
+      trackPendingQueueDelivery(item, deliveryText);
+      if (deliverAs) {
+        pi.sendUserMessage(deliveryText, { deliverAs });
+      } else {
+        pi.sendUserMessage(deliveryText);
+      }
+      return true;
+    } catch (error) {
+      clearPendingQueueDelivery(item.id);
+      if (isStaleExtensionContextError(error)) {
+        queueStore.update(item.id, { status: "queued", error: undefined });
+        currentCtx = null;
+        throw error;
+      }
+      const message = error instanceof Error ? error.message : String(error);
+      queueStore.update(item.id, { status: "failed", error: message });
+      ctx.ui.notify(`Failed to send ${item.id}: ${message}`, "error");
+      requestQueueRender();
+      return false;
+    }
+  }
+
+  function cancelPostCompactionDelivery(): void {
+    if (queueDeliveryTimer) clearTimeout(queueDeliveryTimer);
+    queueDeliveryTimer = null;
+    postCompactionDelivery = null;
+  }
+
+  function schedulePostCompactionDelivery(): void {
+    if (!postCompactionDelivery) return;
+    if (queueDeliveryTimer) clearTimeout(queueDeliveryTimer);
+    const pending = postCompactionDelivery;
+    queueDeliveryTimer = setTimeout(() => {
+      queueDeliveryTimer = null;
+      if (pending !== postCompactionDelivery) return;
+      if (pending.generation !== sessionGeneration || !currentCtx) {
+        cancelPostCompactionDelivery();
+        return;
+      }
+      try {
+        // Busy readiness checks must not read the inbox, render, or enqueue a late follow-up.
+        if (!currentCtx.isIdle()) {
+          schedulePostCompactionDelivery();
+          return;
+        }
+        const items = queueStore.queuedDeliveryItems(pending.context, "post-compact");
+        const item = items[0];
+        if (items.length <= 1) cancelPostCompactionDelivery();
+        if (!item) return;
+        deliverQueueItem(currentCtx, item);
+        schedulePostCompactionDelivery();
+      } catch (error) {
+        if (!isStaleExtensionContextError(error)) throw error;
+        cancelPostCompactionDelivery();
+        currentCtx = null;
+      }
+    }, 50);
+  }
+
+  function blockPostCompactionQueue(ctx: any, errorMessage: string): void {
+    const items = queueStore.queuedDeliveryItems(getQueueContext(ctx), "post-compact");
+    for (const item of items) {
+      queueStore.update(item.id, { status: "blocked", error: errorMessage });
+    }
+    if (items.length > 0) {
+      ctx.ui.notify(`Kept ${items.length} post-compaction item${items.length === 1 ? "" : "s"} blocked`, "warning");
+      requestQueueRender();
+    }
+  }
+
+  function finishFailedCompaction(ctx: any, errorMessage: string): void {
+    compactionGeneration++;
+    powerlineCompacting = false;
+    cancelPostCompactionDelivery();
+    blockPostCompactionQueue(ctx, errorMessage);
+    requestQueueRender();
+  }
+
+  async function chooseQueueAction(ctx: any, item: PowerlineQueueItem): Promise<void> {
+    const actions: SelectItem[] = [
+      { value: "send", label: "Send to current session", description: "Deliver as prompt/follow-up" },
+      { value: "edit", label: "Edit in prompt", description: "Move text into the editor" },
+      { value: "retry", label: "Retry", description: "Mark queued and deliver" },
+      { value: "clear", label: "Clear", description: "Mark item done" },
+      { value: "cancel", label: "Cancel" },
+    ];
+    const selected = await showSelectOverlay(ctx, `Queue item ${item.id}`, buildStashPreview(item.text, 72), actions, actions.length);
+    if (!selected || selected.value === "cancel") return;
+
+    if (selected.value === "send") {
+      deliverQueueItem(ctx, item);
+      return;
+    }
+
+    if (selected.value === "retry") {
+      const updated = queueStore.update(item.id, { status: "queued", error: undefined });
+      if (updated) deliverQueueItem(ctx, updated);
+      return;
+    }
+
+    if (selected.value === "edit") {
+      ctx.ui.setEditorText(item.text);
+      queueStore.clear(item.id);
+      requestQueueRender();
+      return;
+    }
+
+    if (selected.value === "clear") {
+      queueStore.clear(item.id);
+      ctx.ui.notify(`Cleared ${item.id}`, "info");
+      requestQueueRender();
+    }
+  }
+
+  async function openQueuePicker(ctx: any): Promise<void> {
+    const active = queueStore.activeItems(getQueueContext(ctx));
+    if (active.length === 0) {
+      ctx.ui.notify("No queued items", "info");
+      return;
+    }
+
+    const items: SelectItem[] = active.map((item) => ({
+      value: item.id,
+      label: queueItemLabel(item),
+      description: queueItemDescription(item),
+    }));
+    const selected = await showSelectOverlay(
+      ctx,
+      "Powerline queue",
+      "↑↓ navigate • enter manage • esc cancel",
+      items,
+      Math.min(active.length, 12),
+    );
+    if (!selected) return;
+
+    const item = active.find((candidate) => candidate.id === selected.value);
+    if (item) await chooseQueueAction(ctx, item);
+  }
+
+  function resolveCommandTarget(ctx: any, spec: string): QueueTarget {
+    const normalized = spec.trim().replace(/^@/, "");
+    if (normalized === "current") return { kind: "current-session" };
+    if (normalized === "global") return { kind: "global" };
+
+    const cwd = queueStore.resolveAlias(normalized);
+    if (!cwd) throw new Error(`Unknown project alias @${normalized}. Use /queue alias ${normalized} <path> first.`);
+    return { kind: "project", cwd, alias: normalized };
+  }
+
+  function sendOrRetryQueueItem(ctx: any, idPrefix: string): void {
+    const item = queueStore.get(idPrefix);
+    if (!item) {
+      ctx.ui.notify(`No unique queue item matches ${idPrefix}`, "warning");
+      return;
+    }
+    const updated = queueStore.update(item.id, { status: "queued", error: undefined });
+    if (updated) deliverQueueItem(ctx, updated);
+  }
+
   function isPiActionRunnable(id: string): boolean {
     if (PI_PALETTE_RUN_EXCLUDED.has(id)) return false;
     if (id === "app.clipboard.pasteImage") return typeof currentEditor?.onPasteImage === "function";
@@ -1552,7 +2067,7 @@ export default function powerlineFooter(pi: ExtensionAPI) {
   }
 
   async function showShortcutPalette(ctx: any): Promise<void> {
-    const selected = await ctx.ui.custom<ShortcutPaletteEntry | null>(
+    const selected: ShortcutPaletteEntry | null = await ctx.ui.custom(
       (tui: any, theme: Theme, keybindings: any, done: (result: ShortcutPaletteEntry | null) => void) => {
         const entries = buildShortcutPaletteEntries({
           powerlineEntries: getPowerlineShortcutHelpEntries(resolvedShortcuts, bashModeSettings.toggleShortcut),
@@ -1683,17 +2198,10 @@ export default function powerlineFooter(pi: ExtensionAPI) {
       case "stashHistory":
       case "copyEditor":
       case "cutEditor":
+      case "queueOpen":
+      case "reply":
         runPowerlineShortcut(ctx, { kind: key });
         return;
-      case "scrollChatUp":
-      case "scrollChatDown": {
-        if (!fixedEditorCompositor) {
-          ctx.ui.notify("Chat scrolling requires /powerline fixed-editor on", "warning");
-          return;
-        }
-        fixedEditorCompositor.scrollRootBy(key === "scrollChatUp" ? 10 : -10);
-        return;
-      }
       case "editorStart":
       case "editorEnd": {
         if (typeof currentEditor?.moveCursorToEditorBoundary !== "function") {
@@ -1703,27 +2211,35 @@ export default function powerlineFooter(pi: ExtensionAPI) {
         currentEditor.moveCursorToEditorBoundary(key === "editorStart" ? "start" : "end");
         return;
       }
-      default: {
-        const chatJump = CHAT_JUMP_SHORTCUTS.find((entry) => entry.shortcutKey === key);
-        if (chatJump) {
-          runPowerlineShortcut(ctx, { kind: "chat", action: chatJump.action });
-        }
-      }
     }
   }
 
   // Track session start
   pi.on("session_start", async (event, ctx) => {
+    dismissWelcome(currentCtx ?? ctx);
     shellSession?.dispose();
     shellSession = null;
     sessionGeneration++;
     sessionStartTime = Date.now();
     currentCtx = ctx;
+    footerDataRef = null;
+    footerDataCwd = null;
+    invalidateGitStatus();
+    invalidateGitBranch();
+    resetLayoutCache();
     customCompactionEnabled = detectCustomCompactionEnabled(ctx.cwd);
     lastUserPrompt = "";
     isStreaming = false;
     liveAssistantUsage = null;
-    stashedEditorText = null;
+    approximateContextUsage = event.reason === "reload" ? estimateUnknownContextUsage(ctx) : null;
+    powerlineCompacting = false;
+    cancelPostCompactionDelivery();
+    if (event.reason === "reload") {
+      stashedEditorText = takeActiveStashReload(ctx);
+    } else {
+      stashedEditorText = null;
+      clearActiveStashReload(ctx);
+    }
 
     const settings = readSettings(ctx.cwd);
     resolvedShortcuts = resolveShortcutConfig(settings);
@@ -1736,18 +2252,16 @@ export default function powerlineFooter(pi: ExtensionAPI) {
     bashTranscript = new BashTranscriptStore(bashModeSettings);
     bashCompletionEngine = new BashCompletionEngine();
 
-    getThinkingLevelFn = typeof ctx.getThinkingLevel === "function"
-      ? () => ctx.getThinkingLevel()
-      : null;
-    currentThinkingLevel = getThinkingLevelFn?.() ?? null;
+    getThinkingLevelFn = () => ctx.thinkingLevel ?? "off";
+    currentThinkingLevel = getThinkingLevelFn();
 
     if (ctx.hasUI) {
-      ctx.ui.setStatus("stash", undefined);
+      ctx.ui.setStatus("stash", stashedEditorText === null ? undefined : "stash");
     }
 
     if (enabled && ctx.hasUI) {
       setupCustomEditor(ctx);
-      if (shouldShowStartupWelcome(event.reason, config.welcome)) {
+      if (shouldShowStartupWelcome(event.reason, config.welcome, ctx.mode)) {
         if (settings.quietStartup === true) {
           setupWelcomeHeader(ctx);
         } else {
@@ -1761,37 +2275,25 @@ export default function powerlineFooter(pi: ExtensionAPI) {
   });
 
   pi.on("session_shutdown", async (event, ctx) => {
-    // Session switches and reloads preserve keyboard modes (Kitty protocol,
-    // modifyOtherKeys), while non-UI modes must not emit terminal sequences.
-    // In the supported Pi extension API, ctx.hasUI is the available terminal/UI guard.
-    const hasUI = Boolean(ctx.hasUI);
-    const isTerminalExit = shouldResetExtendedKeyboardModesOnShutdown(hasUI, event?.reason);
-
+    if (event.reason === "reload") {
+      transferActiveStashReload(ctx, stashedEditorText);
+    } else {
+      clearActiveStashReload(ctx);
+    }
+    stashedEditorText = null;
     sessionGeneration++;
-    dismissWelcomeOverlay?.();
-    dismissWelcomeOverlay = null;
-    welcomeHeaderActive = false;
-    welcomeOverlayShouldDismiss = false;
-    welcomeDismissScheduler.cancel();
+    dismissWelcome(ctx);
+    restorePendingSend();
     statusRenderScheduler.cancel();
     restoreFooterStatusRepaintHook?.();
     restoreFooterStatusRepaintHook = null;
-    const hadFixedEditorCompositor = teardownFixedEditorCompositor(isTerminalExit ? { resetExtendedKeyboardModes: true } : undefined);
-    if (shouldRestoreInlineEditorCursorOnShutdown(hasUI, event?.reason, config.fixedEditor, hadFixedEditorCompositor)) {
-      try {
-        process.stdout.write(inlineEditorQuitCursorRestore({
-          rows: tuiRef?.terminal?.rows ?? process.stdout.rows,
-          cursorRow: tuiRef?.cursorRow,
-          previousViewportTop: tuiRef?.previousViewportTop,
-        }));
-      } catch (error) {
-        console.debug("[pi-power-user] Failed to restore inline editor cursor on quit:", error);
-      }
-    }
     stashShortcutInputUnsubscribe?.();
     stashShortcutInputUnsubscribe = null;
     shellSession?.dispose();
     shellSession = null;
+    cancelPostCompactionDelivery();
+    requeuePendingQueueDeliveries("Session ended before queued message started");
+    powerlineCompacting = false;
     bashModeActive = false;
     currentCtx = null;
     footerDataRef = null;
@@ -1816,16 +2318,16 @@ export default function powerlineFooter(pi: ExtensionAPI) {
   pi.on("tool_result", async (event) => {
     if (event.toolName === "write" || event.toolName === "edit") {
       invalidateGitStatus();
+      requestStatusRender();
     }
     // Check for bash commands that might change git branch
     if (event.toolName === "bash" && event.input?.command) {
       const cmd = String(event.input.command);
       if (mightChangeGitBranch(cmd)) {
-        // Invalidate caches since working tree state changes with branch
+        // The command has completed, so start refreshing immediately.
         invalidateGitStatus();
         invalidateGitBranch();
-        // Small delay to let git update, then re-render
-        setTimeout(() => requestStatusRender(), 100);
+        requestStatusRender();
       }
     }
   });
@@ -1847,12 +2349,13 @@ export default function powerlineFooter(pi: ExtensionAPI) {
 
   pi.on("model_select", async (_event, ctx) => {
     currentCtx = ctx;
+    coreContextUsageCache.reset();
     requestStatusRender();
   });
 
   pi.on("thinking_level_select", async (event, ctx) => {
     currentCtx = ctx;
-    currentThinkingLevel = getThinkingLevelFn?.() ?? (typeof event.level === "string" ? event.level : null);
+    currentThinkingLevel = resolveThinkingLevelSelection(event.level, getThinkingLevelFn?.());
     requestImmediateStatusRender({ deferDuringTyping: false });
   });
 
@@ -1863,8 +2366,77 @@ export default function powerlineFooter(pi: ExtensionAPI) {
     requestImmediateStatusRender({ deferDuringTyping: false });
   });
 
-  pi.on("before_agent_start", async (event) => {
+  pi.on("session_info_changed", async (_event, ctx) => {
+    currentCtx = ctx;
+    requestImmediateStatusRender({ deferDuringTyping: false });
+  });
+
+  // Custom-message turns have no user prompt and must preserve the current task.
+  pi.on("before_agent_start", async (event, ctx) => {
+    if ("messageType" in event && event.messageType === "custom") return;
+    finishPendingQueueDelivery(event.prompt, ctx);
     lastUserPrompt = event.prompt;
+  });
+
+  // Serializes Jev routing so a quick second message cannot be queued before the first.
+  let autoFollowUpChain: Promise<unknown> = Promise.resolve();
+  // Messages still waiting on Jev have not reached Pi's queue, so Esc cannot restore them; this list does it in submission order.
+  const routingInputs: { text: string; signal: AbortSignal; restored: boolean }[] = [];
+
+  function restoreRoutingInputs(ctx: any, signal: AbortSignal): void {
+    const inputs = routingInputs.filter((input) => input.signal === signal && !input.restored);
+    if (inputs.length === 0) return;
+    for (const input of inputs) input.restored = true;
+    ctx.ui.setEditorText([...inputs.map((input) => input.text), ctx.ui.getEditorText()].filter((text) => text.trim()).join("\n\n"));
+  }
+
+  // Plain Enter while the agent works arrives as steering; move it to the follow-up queue when Jev is confident it can wait.
+  pi.on("input", async (event, ctx) => {
+    if (!config.autoFollowUp || event.source !== "interactive" || event.streamingBehavior !== "steer") return;
+    if (event.text.trimStart().startsWith("/")) return;
+    const apiKey = process.env.TYPESAFE_API_KEY?.trim();
+    if (!apiKey) {
+      ctx.ui.notify("Auto follow-up needs TYPESAFE_API_KEY; sent as steering", "warning");
+      return;
+    }
+
+    const state = { currentTask: lastUserPrompt, agentLatestText: getRecentAgentContext(ctx) ?? "", newMessage: event.text };
+    const generation = sessionGeneration;
+    // Only the run this message was typed into counts: the agent can also go idle by finishing normally, and that must still send.
+    const runSignal: AbortSignal | undefined = ctx.hasUI ? ctx.signal : undefined;
+    const routing = runSignal ? { text: event.text, signal: runSignal, restored: false } : undefined;
+    const onAbort = () => {
+      if (generation === sessionGeneration && routing) restoreRoutingInputs(ctx, routing.signal);
+    };
+    if (routing) {
+      routingInputs.push(routing);
+      routing.signal.addEventListener("abort", onAbort, { once: true });
+    }
+    const decision = autoFollowUpChain.then(() => canWaitAsFollowUp(state, apiKey));
+    autoFollowUpChain = decision.catch(() => {});
+    let followUp = false;
+    let failure: string | undefined;
+    try {
+      followUp = await decision;
+    } catch (error) {
+      failure = error instanceof Error ? error.message : String(error);
+    } finally {
+      if (routing) {
+        routing.signal.removeEventListener("abort", onAbort);
+        routingInputs.splice(routingInputs.indexOf(routing), 1);
+      }
+    }
+    // A session switch during the Jev call must not route this message into the new session.
+    if (generation !== sessionGeneration) return;
+    if (routing?.restored) return { action: "handled" };
+    if (failure !== undefined) {
+      ctx.ui.notify(`Auto follow-up unavailable (${failure}); sent as steering`, "warning");
+      return;
+    }
+    if (!followUp) return;
+
+    pi.sendUserMessage(event.images?.length ? [{ type: "text", text: event.text }, ...event.images] : event.text, { deliverAs: "followUp" });
+    return { action: "handled" };
   });
 
   // Track streaming state (footer only shows status during streaming)
@@ -1888,8 +2460,17 @@ export default function powerlineFooter(pi: ExtensionAPI) {
     }
   });
 
+  pi.on("message_start", async (event, ctx) => {
+    currentCtx = ctx;
+    const message: unknown = event.message;
+    if (isRecord(message) && message.role === "user") {
+      finishPendingQueueDelivery(getPromptHistoryText(message.content), ctx);
+    }
+  });
+
   pi.on("message_end", async (event, ctx) => {
     currentCtx = ctx;
+    coreContextUsageCache.reset();
     if (isSessionAssistantMessage(event.message)) {
       if (event.message.stopReason === "error" || event.message.stopReason === "aborted") {
         liveAssistantUsage = null;
@@ -1902,22 +2483,86 @@ export default function powerlineFooter(pi: ExtensionAPI) {
 
   pi.on("turn_end", async (_event, ctx) => {
     currentCtx = ctx;
+    coreContextUsageCache.reset();
     requestImmediateStatusRender({ deferDuringTyping: false });
   });
 
+  pi.on("session_before_compact", async (_event, ctx) => {
+    powerlineCompacting = true;
+    currentCtx = ctx;
+    isStreaming = false;
+    liveAssistantUsage = null;
+    approximateContextUsage = null;
+    coreContextUsageCache.reset();
+    compactionGeneration++;
+    cancelPostCompactionDelivery();
+    requestQueueRender();
+  });
+
+  pi.on("session_compact", async (event, ctx) => {
+    powerlineCompacting = false;
+    currentCtx = ctx;
+    isStreaming = false;
+    liveAssistantUsage = null;
+    approximateContextUsage = estimateUnknownContextUsage(ctx);
+    coreContextUsageCache.reset();
+    compactionGeneration++;
+    cancelPostCompactionDelivery();
+    const context = getQueueContext(ctx);
+    if (queueStore.queuedDeliveryItems(context, "post-compact").length > 0) {
+      postCompactionDelivery = { generation: sessionGeneration, context };
+      schedulePostCompactionDelivery();
+    }
+    requestQueueRender();
+  });
+
+  pi.on("session_compact_failed", async (event, ctx) => {
+    finishFailedCompaction(ctx, event.errorMessage ?? "Compaction cancelled");
+  });
+
+  pi.on("agent_settled", async () => {
+    schedulePostCompactionDelivery();
+  });
+
+  // Also dismiss on tool calls (agent is working)
   pi.on("tool_call", async (_event, ctx) => {
     dismissWelcome(ctx);
   });
 
-  function dismissWelcome(ctx: any) {
-    welcomeDismissScheduler.cancel();
+  // Helper to extract recent agent response text (skipping thinking blocks)
+  function getRecentAgentContext(ctx: any): string | undefined {
+    const sessionEvents = ctx.sessionManager?.getBranch?.() ?? [];
 
+    // Find the most recent assistant message
+    for (let i = sessionEvents.length - 1; i >= 0; i--) {
+      const e = sessionEvents[i];
+      if (e.type === "message" && e.message?.role === "assistant") {
+        const content = e.message.content;
+        if (!Array.isArray(content)) continue;
+
+        // Extract text content, skip thinking blocks
+        for (const block of content) {
+          if (block.type === "text" && block.text) {
+            // Return first ~200 chars of non-empty text
+            const text = block.text.trim();
+            if (text.length > 0) {
+              return text.slice(0, 200);
+            }
+          }
+        }
+      }
+    }
+    return undefined;
+  }
+
+  function dismissWelcome(ctx: any) {
+    welcomeRequest?.abort();
+    welcomeRequest = null;
+    if (welcomeTimer) clearTimeout(welcomeTimer);
+    welcomeTimer = null;
     if (dismissWelcomeOverlay) {
       dismissWelcomeOverlay();
       dismissWelcomeOverlay = null;
-    } else {
-      // The startup overlay mounts after a delay; dismiss it immediately if it appears later.
-      welcomeOverlayShouldDismiss = true;
     }
     if (welcomeHeaderActive) {
       welcomeHeaderActive = false;
@@ -1925,9 +2570,9 @@ export default function powerlineFooter(pi: ExtensionAPI) {
     }
   }
 
-  function scheduleDismissWelcome(ctx: any) {
-    if (!dismissWelcomeOverlay && welcomeOverlayShouldDismiss && !welcomeHeaderActive) return;
-    welcomeDismissScheduler.schedule(ctx);
+  function dismissWelcomeForInput(ctx: any) {
+    if (!welcomeRequest && !dismissWelcomeOverlay && !welcomeHeaderActive) return;
+    dismissWelcome(ctx);
   }
 
   function addStashHistoryEntry(text: string): void {
@@ -1990,33 +2635,23 @@ export default function powerlineFooter(pi: ExtensionAPI) {
   async function selectPromptHistorySource(
     ctx: any,
     stashCount: number,
-    projectPromptCount: number,
   ): Promise<"stash" | "project" | null> {
+    if (stashCount === 0) {
+      return "project";
+    }
+
     const items: SelectItem[] = [];
 
-    if (stashCount > 0) {
-      items.push({
-        value: "stash",
-        label: "Stashed prompts",
-        description: `${stashCount} saved`,
-      });
-    }
-
-    if (projectPromptCount > 0) {
-      items.push({
-        value: "project",
-        label: "Recent project prompts",
-        description: `${projectPromptCount} recent`,
-      });
-    }
-
-    if (items.length === 0) {
-      return null;
-    }
-
-    if (items.length === 1) {
-      return items[0]?.value === "project" ? "project" : "stash";
-    }
+    items.push({
+      value: "stash",
+      label: "Stashed prompts",
+      description: `${stashCount} saved`,
+    });
+    items.push({
+      value: "project",
+      label: "Recent project prompts",
+      description: "load on demand",
+    });
 
     const selected = await showSelectOverlay(
       ctx, "Prompt history", "↑↓ navigate • enter open • esc cancel",
@@ -2049,12 +2684,13 @@ export default function powerlineFooter(pi: ExtensionAPI) {
     }
   }
 
-  function isStashShortcutInput(data: string): boolean {
-    return matchesStashShortcutInput(data, { includePrintableSharpS: config.stashSharpSShortcut });
+  async function handleSelectedStashHistoryEntry(ctx: any, selected: string): Promise<void> {
+    const action = await ctx.ui.select("Stashed prompt", ["Insert", "Cancel"]);
+    if (action === "Insert") await insertSelectedPromptHistoryEntry(ctx, selected);
   }
 
-  function getChatJumpShortcutAction(data: string): ChatJumpShortcutAction | null {
-    return CHAT_JUMP_SHORTCUTS.find(({ shortcutKey }) => matchesConfiguredShortcut(data, resolvedShortcuts[shortcutKey]))?.action ?? null;
+  function isStashShortcutInput(data: string): boolean {
+    return matchesStashShortcutInput(data, { includePrintableSharpS: config.stashSharpSShortcut });
   }
 
   function isPromptHistoryShortcutInput(data: string): boolean {
@@ -2081,12 +2717,17 @@ export default function powerlineFooter(pi: ExtensionAPI) {
     if (matchesConfiguredShortcut(data, resolvedShortcuts.cutEditor)) {
       return { kind: "cutEditor" };
     }
+    if (matchesConfiguredShortcut(data, resolvedShortcuts.queueOpen)) {
+      return { kind: "queueOpen" };
+    }
+    if (resolvedShortcuts.reply && matchesConfiguredShortcut(data, resolvedShortcuts.reply)) {
+      return { kind: "reply" };
+    }
     if (matchesConfiguredShortcut(data, bashModeSettings.toggleShortcut)) {
       return { kind: "bashMode" };
     }
 
-    const chatJumpAction = getChatJumpShortcutAction(data);
-    return chatJumpAction ? { kind: "chat", action: chatJumpAction } : null;
+    return null;
   }
 
   function runPowerlineShortcut(ctx: any, action: PowerlineShortcutAction): void {
@@ -2112,17 +2753,20 @@ export default function powerlineFooter(pi: ExtensionAPI) {
       return;
     }
 
+    if (action.kind === "queueOpen") {
+      void openQueuePicker(ctx);
+      return;
+    }
+
+    if (action.kind === "reply") {
+      void import("./quote-reply.ts").then(({ reply }) => reply("", ctx));
+      return;
+    }
+
     if (action.kind === "bashMode") {
       void setBashModeActive(!bashModeActive, ctx);
       return;
     }
-
-    if (action.action.kind === "bottom") {
-      jumpChatToBottom(ctx);
-      return;
-    }
-
-    jumpToChatMessage(ctx, action.action.role, action.action.direction);
   }
 
   function stashOrRestoreEditorText(ctx: any): void {
@@ -2150,36 +2794,43 @@ export default function powerlineFooter(pi: ExtensionAPI) {
   }
 
   async function openStashHistory(ctx: any): Promise<void> {
-    let projectPrompts: string[] = [];
-
-    try {
-      projectPrompts = readRecentProjectPrompts(ctx.cwd, PROJECT_PROMPT_HISTORY_LIMIT);
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      ctx.ui.notify(`Failed to load project prompts: ${message}`, "warning");
-    }
-
-    if (stashedPromptHistory.length === 0 && projectPrompts.length === 0) {
-      ctx.ui.notify("No prompt history yet", "info");
-      return;
-    }
-
-    const source = await selectPromptHistorySource(ctx, stashedPromptHistory.length, projectPrompts.length);
+    const source = await selectPromptHistorySource(ctx, stashedPromptHistory.length);
     if (!source) {
       return;
     }
 
-    const selected = source === "project"
-      ? await selectProjectPromptFromHistory(ctx, projectPrompts)
-      : await selectStashedPromptFromHistory(ctx);
+    if (source === "project") {
+      let projectPrompts: string[] = [];
+      try {
+        projectPrompts = readRecentProjectPrompts(ctx.cwd, PROJECT_PROMPT_HISTORY_LIMIT);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        ctx.ui.notify(`Failed to load project prompts: ${message}`, "warning");
+        return;
+      }
+
+      if (projectPrompts.length === 0) {
+        ctx.ui.notify(stashedPromptHistory.length === 0 ? "No prompt history yet" : "No recent project prompts", "info");
+        return;
+      }
+
+      const selected = await selectProjectPromptFromHistory(ctx, projectPrompts);
+      if (!selected) return;
+
+      await insertSelectedPromptHistoryEntry(ctx, selected);
+      return;
+    }
+
+    const selected = await selectStashedPromptFromHistory(ctx);
     if (!selected) return;
 
-    await insertSelectedPromptHistoryEntry(ctx, selected);
+    await handleSelectedStashHistoryEntry(ctx, selected);
   }
 
   pi.on("agent_end", async (_event, ctx) => {
     isStreaming = false;
     liveAssistantUsage = null;
+    coreContextUsageCache.reset();
 
     let hasUI = false;
     try {
@@ -2191,35 +2842,122 @@ export default function powerlineFooter(pi: ExtensionAPI) {
     }
 
     currentCtx = ctx;
-    try {
-      if (hasUI) {
-        if (stashedEditorText !== null) {
-          if (ctx.ui.getEditorText().trim() === "") {
-            ctx.ui.setEditorText(stashedEditorText);
-            stashedEditorText = null;
-            ctx.ui.setStatus("stash", undefined);
-            ctx.ui.notify("Stash restored", "info");
-          } else {
-            ctx.ui.notify("Stash preserved — clear editor then Alt+S to restore", "info");
-          }
-        }
-      }
-    } catch (error) {
-      if (!isStaleExtensionContextError(error)) throw error;
-      currentCtx = null;
-      return;
-    }
 
     requestStatusRender();
+    schedulePostCompactionDelivery();
+  });
+
+  registerCdCommand(pi, () => currentCtx?.cwd ?? process.cwd());
+
+  pi.registerCommand("reply", {
+    description: "Quote a previous user or assistant message into the editor",
+    handler: async (args, ctx) => {
+      const { reply } = await import("./quote-reply.ts");
+      await reply(args, ctx);
+    },
+  });
+
+  pi.registerCommand("queue", {
+    description: "Manage Powerline queued prompts and project aliases",
+    handler: async (args, ctx) => {
+      currentCtx = ctx;
+      const parts = args.trim().split(/\s+/).filter(Boolean);
+      const action = parts[0];
+
+      if (!action) {
+        await openQueuePicker(ctx);
+        return;
+      }
+
+      if (action === "alias") {
+        const alias = parts[1];
+        const aliasPath = parts.slice(2).join(" ") || ctx.cwd || process.cwd();
+        if (!alias) {
+          ctx.ui.notify("Usage: /queue alias <name> [path]", "info");
+          return;
+        }
+        try {
+          queueStore.setAlias(alias, aliasPath);
+          ctx.ui.notify(`Alias @${alias} → ${aliasPath}`, "info");
+        } catch (error) {
+          ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");
+        }
+        return;
+      }
+
+      if (action === "send" || action === "retry") {
+        const id = parts[1];
+        if (!id) {
+          const item = queueStore.queuedDeliveryItems(getQueueContext(ctx))[0];
+          if (!item) {
+            ctx.ui.notify("No queued item to send", "info");
+            return;
+          }
+          sendOrRetryQueueItem(ctx, item.id);
+          return;
+        }
+        sendOrRetryQueueItem(ctx, id);
+        return;
+      }
+
+      if (action === "clear") {
+        const id = parts[1];
+        if (id === "all") {
+          const active = queueStore.activeItems(getQueueContext(ctx));
+          for (const item of active) queueStore.clear(item.id);
+          ctx.ui.notify(`Cleared ${active.length} queued item${active.length === 1 ? "" : "s"}`, "info");
+          requestQueueRender();
+          return;
+        }
+        if (!id) {
+          ctx.ui.notify("Usage: /queue clear <id|all>", "info");
+          return;
+        }
+        const item = queueStore.get(id);
+        if (!item) {
+          ctx.ui.notify(`No unique queued item matches ${id}`, "warning");
+          return;
+        }
+        queueStore.clear(item.id);
+        ctx.ui.notify(`Cleared ${item.id}`, "info");
+        requestQueueRender();
+        return;
+      }
+
+      if (action === "target") {
+        const id = parts[1];
+        const spec = parts[2];
+        if (!id || !spec) {
+          ctx.ui.notify("Usage: /queue target <id> @alias|global|current", "info");
+          return;
+        }
+        const item = queueStore.get(id);
+        if (!item) {
+          ctx.ui.notify(`No unique queue item matches ${id}`, "warning");
+          return;
+        }
+        try {
+          const target = resolveCommandTarget(ctx, spec);
+          queueStore.update(item.id, { target });
+          ctx.ui.notify(`Retargeted ${item.id}`, "info");
+          requestQueueRender();
+        } catch (error) {
+          ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");
+        }
+        return;
+      }
+
+      ctx.ui.notify("Usage: /queue [send|retry|clear|target|alias]", "info");
+    },
   });
 
   // Command to toggle/configure
   pi.registerCommand("powerline", {
-    description: "Configure powerline status, fixed editor, and shortcuts",
+    description: "Configure powerline status and shortcuts",
     handler: async (args, ctx) => {
       // Update context reference (command ctx may have more methods)
       currentCtx = ctx;
-      
+
       if (!args?.trim()) {
         // Toggle
         enabled = !enabled;
@@ -2231,19 +2969,16 @@ export default function powerlineFooter(pi: ExtensionAPI) {
           shellSession = null;
           bashTranscript.clear();
           bashModeActive = false;
-          dismissWelcomeOverlay?.();
-          dismissWelcomeOverlay = null;
-          welcomeHeaderActive = false;
-          welcomeOverlayShouldDismiss = false;
-          welcomeDismissScheduler.cancel();
+          dismissWelcome(ctx);
           getPromptHistoryState().savedPromptHistory = [];
           stashedEditorText = null;
-                ctx.ui.setStatus("stash", undefined);
+          clearActiveStashReload(ctx);
+          ctx.ui.setStatus("stash", undefined);
           restoreFooterStatusRepaintHook?.();
           restoreFooterStatusRepaintHook = null;
-          teardownFixedEditorCompositor();
           stashShortcutInputUnsubscribe?.();
           stashShortcutInputUnsubscribe = null;
+          restorePendingSend();
           // Clear all custom UI components
           ctx.ui.setEditorComponent(undefined);
           ctx.ui.setFooter(undefined);
@@ -2252,6 +2987,8 @@ export default function powerlineFooter(pi: ExtensionAPI) {
           ctx.ui.setWidget("powerline-secondary", undefined);
           ctx.ui.setWidget("powerline-bash-transcript", undefined);
           ctx.ui.setWidget("powerline-status", undefined);
+          ctx.ui.setWidget("powerline-pending-send", undefined);
+          ctx.ui.setWidget("powerline-queue-preview", undefined);
           ctx.ui.setWidget("powerline-last-prompt", undefined);
           footerDataRef = null;
           tuiRef = null;
@@ -2271,38 +3008,6 @@ export default function powerlineFooter(pi: ExtensionAPI) {
         return;
       }
 
-      const scrollAwayCardMatch = /^scroll-away-card(?:\s+(on|off|toggle))?$/.exec(normalizedArgs);
-      if (scrollAwayCardMatch) {
-        const mode = scrollAwayCardMatch[1] ?? "toggle";
-        config.scrollAwayNavigationCard = mode === "toggle" ? !config.scrollAwayNavigationCard : mode === "on";
-        if (enabled && ctx.hasUI && config.fixedEditor && tuiRef && currentEditor) {
-          installFixedEditorCompositor(ctx, tuiRef);
-        }
-
-        if (writePowerlineOptionSetting(ctx.cwd, { scrollAwayNavigationCard: config.scrollAwayNavigationCard }, config.preset)) {
-          ctx.ui.notify(`Powerline scroll-away card ${config.scrollAwayNavigationCard ? "enabled" : "disabled"}`, "info");
-        } else {
-          ctx.ui.notify(`Powerline scroll-away card ${config.scrollAwayNavigationCard ? "enabled" : "disabled"} (not persisted; check settings.json)`, "warning");
-        }
-        return;
-      }
-
-      const mouseScrollMatch = /^mouse-scroll(?:\s+(on|off|toggle))?$/.exec(normalizedArgs);
-      if (mouseScrollMatch) {
-        const mode = mouseScrollMatch[1] ?? "toggle";
-        config.mouseScroll = mode === "toggle" ? !config.mouseScroll : mode === "on";
-        if (enabled && ctx.hasUI && config.fixedEditor && tuiRef && currentEditor) {
-          installFixedEditorCompositor(ctx, tuiRef);
-        }
-
-        if (writePowerlineOptionSetting(ctx.cwd, { mouseScroll: config.mouseScroll }, config.preset)) {
-          ctx.ui.notify(`Powerline mouse scroll ${config.mouseScroll ? "enabled" : "disabled"}`, "info");
-        } else {
-          ctx.ui.notify(`Powerline mouse scroll ${config.mouseScroll ? "enabled" : "disabled"} (not persisted; check settings.json)`, "warning");
-        }
-        return;
-      }
-
       const placementMatch = /^placement(?:\s+(above|below|toggle))?$/.exec(normalizedArgs);
       if (placementMatch) {
         const requestedPlacement = placementMatch[1];
@@ -2310,34 +3015,12 @@ export default function powerlineFooter(pi: ExtensionAPI) {
           ? requestedPlacement
           : config.placement === "above" ? "below" : "above";
         config.invalidPlacement = null;
-        if (enabled && ctx.hasUI) {
-          if (config.fixedEditor && tuiRef && currentEditor) {
-            installFixedEditorCompositor(ctx, tuiRef);
-          } else if (!config.fixedEditor) {
-            installPowerlineWidgets(ctx);
-          }
-        }
+        if (enabled && ctx.hasUI) setupCustomEditor(ctx);
 
         if (writePowerlineOptionSetting(ctx.cwd, { placement: config.placement }, config.preset)) {
           ctx.ui.notify(`Powerline placement set to: ${config.placement}`, "info");
         } else {
           ctx.ui.notify(`Powerline placement set to: ${config.placement} (not persisted; check settings.json)`, "warning");
-        }
-        return;
-      }
-
-      const fixedEditorMatch = /^fixed-editor(?:\s+(on|off|toggle))?$/.exec(normalizedArgs);
-      if (fixedEditorMatch) {
-        const mode = fixedEditorMatch[1] ?? "toggle";
-        config.fixedEditor = mode === "toggle" ? !config.fixedEditor : mode === "on";
-        if (enabled && ctx.hasUI) {
-          setupCustomEditor(ctx);
-        }
-
-        if (writePowerlineOptionSetting(ctx.cwd, { fixedEditor: config.fixedEditor }, config.preset)) {
-          ctx.ui.notify(`Powerline fixed editor ${config.fixedEditor ? "enabled" : "disabled"}`, "info");
-        } else {
-          ctx.ui.notify(`Powerline fixed editor ${config.fixedEditor ? "enabled" : "disabled"} (not persisted; check settings.json)`, "warning");
         }
         return;
       }
@@ -2397,6 +3080,22 @@ export default function powerlineFooter(pi: ExtensionAPI) {
     },
   });
 
+  pi.registerCommand("powerline-perf", {
+    description: "Show or reset opt-in editor performance profiling",
+    handler: async (args, ctx) => {
+      if (!editorPerf.options.enabled) {
+        ctx.ui.notify("Set POWERLINE_DEBUG_PERF=1 and reload to enable editor profiling", "info");
+        return;
+      }
+      if (args.trim().toLowerCase() === "reset") {
+        editorPerf.reset();
+        ctx.ui.notify("Powerline editor performance counters reset", "info");
+        return;
+      }
+      ctx.ui.notify(editorPerf.report(), "info");
+    },
+  });
+
   pi.registerCommand("bash-reset", {
     description: "Reset the managed bash session",
     handler: async (_args, ctx) => {
@@ -2420,31 +3119,48 @@ export default function powerlineFooter(pi: ExtensionAPI) {
   });
 
 
-  function buildSegmentContext(ctx: any, theme: Theme): SegmentContext {
+  function buildSegmentContext(ctx: any, theme: Theme, allSegmentIds: StatusLineSegmentId[]): SegmentContext {
     const presetDef = getPreset(config.preset);
     const colors: ColorScheme = presetDef.colors ?? getDefaultColors();
 
     // Build usage stats and get thinking level from session (cached; the full
     // event list is only re-scanned when events are appended or the trailing
     // event's stats-relevant fields change, e.g. in-place streaming updates)
-    const sessionEvents = ctx.sessionManager?.getBranch?.() ?? [];
+    const sessionEvents = sessionBranchCache.get(ctx.sessionManager);
     const tokenStats = tokenStatsCache.get(sessionEvents);
-    const { input, output, cacheRead, cacheWrite, cost } = tokenStats;
+    const { input, output, cacheRead, cacheWrite, cost, subagentCost } = tokenStats;
     const lastAssistant = tokenStats.lastAssistant;
     const thinkingLevelFromSession = tokenStats.thinkingLevelFromSession;
 
     // Calculate context percentage.
     const latestUsage = isStreaming ? liveAssistantUsage ?? lastAssistant?.usage : lastAssistant?.usage;
-    const coreContextUsage = isStreaming && liveAssistantUsage ? null : readCoreContextUsage(ctx);
-    const contextTokens = coreContextUsage?.contextTokens ?? (latestUsage ? getUsageTokenTotal(latestUsage) : 0);
-    const contextWindow = coreContextUsage?.contextWindow ?? ctx.model?.contextWindow ?? 0;
-    const contextPercent = coreContextUsage?.contextPercent ?? (contextWindow > 0 ? (contextTokens / contextWindow) * 100 : 0);
+    const coreContextUsage = isStreaming && liveAssistantUsage ? null : coreContextUsageCache.get(ctx);
+    const fallbackContextTokens = latestUsage ? getUsageTokenTotal(latestUsage) : 0;
+    const {
+      contextTokens,
+      contextWindow,
+      contextPercent,
+    } = resolveDisplayContextUsage({
+      coreContextUsage,
+      unknownCoreFallback: approximateContextUsage,
+      fallbackContextTokens,
+      fallbackContextWindow: ctx.model?.contextWindow ?? 0,
+    });
+    const contextApproximate = coreContextUsage?.contextTokens === null && approximateContextUsage !== null;
 
     const segmentOptions = mergeSegmentOptions(presetDef.segmentOptions, config.segmentOptions);
 
-    // Get git status (cached)
-    const gitBranch = footerDataRef?.getGitBranch() ?? null;
-    const gitStatus = getGitStatus(gitBranch, segmentOptions.git?.polling);
+    const gitOptions = segmentOptions.git;
+    const showGit = allSegmentIds.includes("git") && [
+      gitOptions?.showBranch, gitOptions?.showStaged, gitOptions?.showUnstaged, gitOptions?.showUntracked,
+    ].some((visible) => visible !== false);
+    const gitBranch = showGit && footerDataCwd === ctx.cwd
+      ? footerDataRef?.getGitBranch() ?? null
+      : null;
+    // Full mode retains counts for dirty branch coloring, even with hidden indicators.
+    const gitStatus = showGit
+      ? getGitStatus(gitBranch, gitOptions?.polling, ctx.cwd)
+      : { branch: null, staged: 0, unstaged: 0, untracked: 0 };
     const extensionStatuses = footerDataRef?.getExtensionStatuses() ?? new Map();
     const customItemsById = new Map(config.customItems.map((item) => [item.id, item]));
     const hiddenExtensionStatusKeys = collectHiddenExtensionStatusKeys(config.customItems);
@@ -2462,21 +3178,33 @@ export default function powerlineFooter(pi: ExtensionAPI) {
     const subscriptionUsage = usingSubscription && subscriptionUsageProvider
       ? subscriptionUsageByProvider.get(subscriptionUsageProvider)?.usage ?? null
       : null;
+
     const thinkingLevel = currentThinkingLevel ?? thinkingLevelFromSession ?? getThinkingLevelFn?.() ?? "off";
+    const queueSummary: QueueSummary = allSegmentIds.includes("queue") ? getQueueSummary(ctx) : {
+      queueCount: 0,
+      blockedCount: 0,
+      compacting: powerlineCompacting,
+      leadingText: null,
+      leadingIntent: null,
+      leadingStatus: null,
+    };
 
     return {
       model: ctx.model,
       thinkingLevel,
       sessionId: ctx.sessionManager?.getSessionId?.(),
+      sessionName: ctx.sessionManager?.getSessionName?.(),
       cwd: ctx.cwd,
-      usageStats: { input, output, cacheRead, cacheWrite, cost },
+      usageStats: { input, output, cacheRead, cacheWrite, cost, subagentCost },
       contextTokens,
       contextPercent,
       contextWindow,
+      contextApproximate,
       autoCompactEnabled: ctx.settingsManager?.getCompactionSettings?.()?.enabled ?? true,
       customCompactionEnabled: customCompactionEnabled || extensionStatuses.has(CUSTOM_COMPACTION_STATUS_KEY),
       usingSubscription,
       subscriptionUsage,
+      queueSummary,
       sessionStartTime,
       shellModeActive: bashModeActive,
       shellRunning: shellSession?.state.running ?? false,
@@ -2496,7 +3224,7 @@ export default function powerlineFooter(pi: ExtensionAPI) {
    * Get cached responsive layout or compute fresh one.
    * The segment context scans session state, so keep it stable across render bursts.
    */
-  function getResponsiveLayout(width: number, theme: Theme): { topContent: string; secondaryContent: string } {
+  function getResponsiveLayout(width: number, theme: Theme): ResponsiveLayout {
     const now = Date.now();
     const cacheTtl = isStreaming ? STREAMING_LAYOUT_CACHE_TTL_MS : LAYOUT_CACHE_TTL_MS;
 
@@ -2514,14 +3242,25 @@ export default function powerlineFooter(pi: ExtensionAPI) {
     }
 
     const presetDef = getPreset(config.preset);
+    const mergedSegments = mergeSegmentsWithCustomItems(presetDef, config.customItems, {
+      layout: config.layout,
+      disabledSegments: config.disabledSegments,
+    });
+    const allSegmentIds = [
+      ...mergedSegments.leftSegments,
+      ...mergedSegments.rightSegments,
+      ...mergedSegments.secondarySegments,
+    ];
     let segmentCtx: SegmentContext;
     try {
-      segmentCtx = buildSegmentContext(currentCtx, theme);
+      segmentCtx = editorPerf.options.enabled
+        ? editorPerf.measure("layout.segment-context", () => buildSegmentContext(currentCtx, theme, allSegmentIds))
+        : buildSegmentContext(currentCtx, theme, allSegmentIds);
     } catch (error) {
       if (!isStaleExtensionContextError(error)) throw error;
       currentCtx = null;
       lastLayoutWidth = width;
-      lastLayoutResult = { topContent: "", secondaryContent: "" };
+      lastLayoutResult = { topContent: "", secondaryLines: [] };
       lastLayoutTimestamp = now;
       layoutDirty = false;
       forceNextLayoutRecompute = false;
@@ -2529,7 +3268,7 @@ export default function powerlineFooter(pi: ExtensionAPI) {
     }
 
     lastLayoutWidth = width;
-    lastLayoutResult = computeResponsiveLayout(segmentCtx, presetDef, width);
+    lastLayoutResult = computeResponsiveLayout(segmentCtx, presetDef, allSegmentIds, width);
     lastLayoutTimestamp = now;
     layoutDirty = false;
     forceNextLayoutRecompute = false;
@@ -2565,8 +3304,30 @@ export default function powerlineFooter(pi: ExtensionAPI) {
   function renderPowerlineSecondaryLines(width: number, theme: Theme): string[] {
     if (!currentCtx) return [];
 
-    const layout = getResponsiveLayout(width, theme);
-    return layout.secondaryContent ? [layout.secondaryContent] : [];
+    return [...getResponsiveLayout(width, theme).secondaryLines];
+  }
+
+  function renderPowerlineQueuePreviewLines(width: number, theme: Theme): string[] {
+    if (!currentCtx) return [];
+    const summary = getQueueSummary(currentCtx);
+    if (!summary.leadingText) return [];
+
+    const prefix = summary.leadingStatus === "blocked" || summary.leadingStatus === "failed"
+      ? "blocked: "
+      : summary.leadingStatus === "delivering"
+        ? "sending: "
+        : "queued: ";
+    const text = `${prefix}${summary.leadingText.replace(/\s+/g, " ").trim()}`;
+    const color = summary.leadingStatus === "blocked" || summary.leadingStatus === "failed" ? "warning" : "dim";
+    return [` ${theme.fg(color, truncateToWidth(text, Math.max(1, width - 1), "…"))}`];
+  }
+
+  function renderPendingSendLines(width: number, theme: Theme): string[] {
+    if (!pendingSend) return [];
+    const seconds = Math.max(1, Math.ceil((pendingSend.deadline - Date.now()) / 1000));
+    const hint = theme.fg("accent", `sending in ${seconds}s · esc to edit · enter to send now`);
+    const preview = theme.fg("dim", pendingSend.text.replace(/\s+/g, " "));
+    return [truncateToWidth(` ${hint}  ${preview}`, width, "…")];
   }
 
   function renderBashTranscriptLines(width: number, theme: Theme): string[] {
@@ -2603,256 +3364,52 @@ export default function powerlineFooter(pi: ExtensionAPI) {
   function renderLastPromptLines(width: number): string[] {
     if (bashModeActive || !showLastPrompt || !lastUserPrompt) return [];
 
-    const prefix = ` ${getFgAnsiCode("sep")}↳${ansi.reset} `;
+    const color = getFgAnsiCode("sep");
+    if (
+      lastPromptRenderCache
+      && lastPromptRenderCache.source === lastUserPrompt
+      && lastPromptRenderCache.width === width
+      && lastPromptRenderCache.color === color
+    ) {
+      return lastPromptRenderCache.lines;
+    }
+
+    const compact = lastPromptRenderCache?.source === lastUserPrompt
+      ? lastPromptRenderCache.compact
+      : lastUserPrompt.replace(/\s+/g, " ").trim();
+    const prefix = ` ${color}↳${ansi.reset} `;
     const availableWidth = width - visibleWidth(prefix);
-    if (availableWidth < 10) return [];
+    const lines = compact && availableWidth >= 10
+      ? [truncateToWidth(`${prefix}${color}${truncateToWidth(compact, availableWidth, "…")}${ansi.reset}`, width, "…")]
+      : [];
 
-    let promptText = lastUserPrompt.replace(/\s+/g, " ").trim();
-    if (!promptText) return [];
-
-    promptText = truncateToWidth(promptText, availableWidth, "…");
-
-    const styledPrompt = `${getFgAnsiCode("sep")}${promptText}${ansi.reset}`;
-    const line = `${prefix}${styledPrompt}`;
-    return [truncateToWidth(line, width, "…")];
-  }
-
-  function teardownFixedEditorCompositor(options?: { resetExtendedKeyboardModes?: boolean }): boolean {
-    const hadCompositor = fixedEditorCompositor !== null;
-    fixedEditorCompositor?.dispose(options);
-    if (!hadCompositor && options?.resetExtendedKeyboardModes) {
-      try {
-        process.stdout.write(emergencyTerminalModeReset());
-      } catch {
-        // Shutdown cleanup cannot surface useful terminal write failures.
-      }
-    }
-    fixedEditorCompositor = null;
-    fixedStatusContainer = null;
-    fixedEditorContainer = null;
-    fixedWidgetContainerAbove = null;
-    fixedWidgetContainerBelow = null;
-    return hadCompositor;
-  }
-
-  function findContainerWithChild(tui: any, child: any): { container: any; index: number } | null {
-    const children = Array.isArray(tui?.children) ? tui.children : [];
-    const index = children.findIndex((candidate: any) => Array.isArray(candidate?.children) && candidate.children.includes(child));
-    if (index === -1) return null;
-
-    return { container: children[index], index };
-  }
-
-  function installFixedEditorCompositor(ctx: any, tui: any) {
-    teardownFixedEditorCompositor();
-
-    if (!ctx.hasUI || !config.fixedEditor) return;
-    if (!tui?.terminal || typeof tui.terminal.write !== "function") {
-      throw new Error("[pi-power-user] Fixed editor compositor could not find tui.terminal.write()");
-    }
-    if (!currentEditor) {
-      throw new Error("[pi-power-user] Fixed editor compositor expected the custom editor to be installed first");
-    }
-
-    const editorContainerMatch = findContainerWithChild(tui, currentEditor);
-    if (!editorContainerMatch) {
-      throw new Error("[pi-power-user] Fixed editor compositor could not find the editor container in TUI children");
-    }
-
-    const tuiChildren = Array.isArray(tui.children) ? tui.children : [];
-    fixedEditorContainer = editorContainerMatch.container;
-    const statusContainerCandidate = tuiChildren[editorContainerMatch.index - 2] ?? null;
-    fixedStatusContainer = statusContainerCandidate && typeof statusContainerCandidate.render === "function"
-      ? statusContainerCandidate
-      : null;
-    fixedWidgetContainerAbove = tuiChildren[editorContainerMatch.index - 1] ?? null;
-    fixedWidgetContainerBelow = tuiChildren[editorContainerMatch.index + 1] ?? null;
-
-    const fallbackTheme = ctx.ui.theme;
-    const readRenderTheme = (): Theme => {
-      if (!currentCtx) return fallbackTheme;
-      try {
-        return currentCtx.ui?.theme ?? fallbackTheme;
-      } catch (error) {
-        if (!isStaleExtensionContextError(error)) throw error;
-        currentCtx = null;
-        resetLayoutCache();
-        return fallbackTheme;
-      }
-    };
-
-    const scrollAwayNavigationCard = config.scrollAwayNavigationCard
-      ? {
-        shortcuts: [
-          scrollAwayShortcutEntry("bottom", resolvedShortcuts.jumpChatBottom),
-          scrollAwayShortcutEntry("previousUser", resolvedShortcuts.jumpPreviousUserMessage),
-          scrollAwayShortcutEntry("nextUser", resolvedShortcuts.jumpNextUserMessage),
-          scrollAwayShortcutEntry("previousAssistant", resolvedShortcuts.jumpPreviousLlmMessage),
-          scrollAwayShortcutEntry("nextAssistant", resolvedShortcuts.jumpNextLlmMessage),
-        ].filter((shortcut): shortcut is { id: ScrollAwayShortcutId; shortcutLabel: string } => shortcut !== null),
-        onClickBottom: resolvedShortcuts.jumpChatBottom ? () => jumpChatToBottom(ctx) : undefined,
-      }
-      : undefined;
-
-    let compositor: TerminalSplitCompositor;
-    compositor = new TerminalSplitCompositor({
-      tui,
-      terminal: tui.terminal,
-      canRepaintClusterOnly: () => {
-        const children = fixedEditorContainer?.children;
-        return Array.isArray(children)
-          && children.length > 0
-          && currentEditor !== null
-          && !children.includes(currentEditor);
-      },
-      mouseScroll: config.mouseScroll,
-      keyboardScrollShortcuts: {
-        up: resolvedShortcuts.scrollChatUp,
-        down: resolvedShortcuts.scrollChatDown,
-      },
-      scrollRepaintThrottleMs: DEFAULT_SCROLL_REPAINT_THROTTLE_MS,
-      scrollAwayNavigationCard,
-      onCopySelection: (text, source) => copyTextToClipboard(ctx, text, source === "explicit" ? "Copied selection" : undefined),
-      autoCopyOnSelect: config.copyOnSelect,
-      getShowHardwareCursor: () => typeof tui.getShowHardwareCursor === "function" && tui.getShowHardwareCursor(),
-      renderCluster: (width, terminalRows) => {
-        const theme = readRenderTheme();
-        const statusContainerLines = fixedStatusContainer
-          ? compositor.renderHidden(fixedStatusContainer, width).filter((line) => visibleWidth(line) > 0)
-          : [];
-        const aboveWidgetLines = fixedWidgetContainerAbove ? compositor.renderHidden(fixedWidgetContainerAbove, width) : [];
-        const belowWidgetLines = fixedWidgetContainerBelow ? compositor.renderHidden(fixedWidgetContainerBelow, width) : [];
-        return renderFixedEditorCluster({
-          width,
-          terminalRows,
-          statusLines: [...aboveWidgetLines, ...renderPowerlineStatusLines(width), ...statusContainerLines],
-          primaryLines: renderPowerlinePrimaryLines(width, theme),
-          placement: config.placement,
-          editorLines: fixedEditorContainer ? compositor.renderHidden(fixedEditorContainer, width) : [],
-          secondaryLines: [...renderPowerlineSecondaryLines(width, theme), ...belowWidgetLines],
-          transcriptLines: renderBashTranscriptLines(width, theme),
-          lastPromptLines: renderLastPromptLines(width),
-        });
-      },
-    });
-
-    fixedEditorCompositor = compositor;
-    if (fixedStatusContainer?.render) compositor.hideRenderable(fixedStatusContainer);
-    if (fixedWidgetContainerAbove?.render) compositor.hideRenderable(fixedWidgetContainerAbove);
-    compositor.hideRenderable(fixedEditorContainer);
-    if (fixedWidgetContainerBelow?.render) compositor.hideRenderable(fixedWidgetContainerBelow);
-    compositor.install();
-    tui.requestRender(true);
-  }
-
-  function isChatMessageComponentForRole(component: unknown, role: ChatJumpRole): boolean {
-    const componentName = typeof component === "object" && component !== null ? component.constructor?.name : undefined;
-    if (role === "assistant") {
-      return componentName === "AssistantMessageComponent";
-    }
-
-    return componentName === "UserMessageComponent" || componentName === "SkillInvocationMessageComponent";
-  }
-
-  function renderLineCount(component: unknown, width: number): number {
-    if (typeof component !== "object" || component === null) return 0;
-
-    const render = Reflect.get(component, "render");
-    if (typeof render !== "function") return 0;
-
-    const lines = render.call(component, width);
-    return Array.isArray(lines) ? lines.length : 0;
-  }
-
-  function collectMessageStartLines(component: unknown, width: number, role: ChatJumpRole, offset: number): {
-    targets: number[];
-    lineCount: number;
-  } {
-    const lineCount = renderLineCount(component, width);
-    if (isChatMessageComponentForRole(component, role)) {
-      return { targets: [offset], lineCount };
-    }
-
-    const children = typeof component === "object" && component !== null ? Reflect.get(component, "children") : null;
-    if (!Array.isArray(children) || children.length === 0) {
-      return { targets: [], lineCount };
-    }
-
-    const targets: number[] = [];
-    let childOffset = offset;
-    let childrenLineCount = 0;
-    for (const child of children) {
-      const result = collectMessageStartLines(child, width, role, childOffset);
-      targets.push(...result.targets);
-      childOffset += result.lineCount;
-      childrenLineCount += result.lineCount;
-    }
-
-    return { targets, lineCount: Math.max(lineCount, childrenLineCount) };
-  }
-
-  function collectChatMessageStartLines(role: ChatJumpRole): number[] {
-    const children = Array.isArray(tuiRef?.children) ? tuiRef.children : [];
-    const width = Math.max(1, tuiRef?.terminal?.columns ?? 80);
-    const targets: number[] = [];
-    let offset = 0;
-
-    for (const child of children) {
-      const result = collectMessageStartLines(child, width, role, offset);
-      targets.push(...result.targets);
-      offset += result.lineCount;
-    }
-
-    return [...new Set(targets)].sort((a, b) => a - b);
-  }
-
-  function jumpToChatMessage(ctx: any, role: ChatJumpRole, direction: ChatJumpDirection): boolean {
-    if (!fixedEditorCompositor) {
-      ctx.ui.notify("Chat message jumps require /powerline fixed-editor on", "warning");
-      return false;
-    }
-
-    const targets = collectChatMessageStartLines(role);
-    const label = role === "assistant" ? "LLM" : "user";
-    if (targets.length === 0) {
-      ctx.ui.notify(`No ${label} messages found`, "info");
-      return false;
-    }
-
-    const jumped = direction === "previous"
-      ? fixedEditorCompositor.jumpToPreviousRootTarget(targets)
-      : fixedEditorCompositor.jumpToNextRootTarget(targets);
-    if (!jumped) {
-      ctx.ui.notify(`No ${direction} ${label} message`, "info");
-      return false;
-    }
-
-    return true;
-  }
-
-  function jumpChatToBottom(ctx: any): boolean {
-    if (!fixedEditorCompositor) {
-      ctx.ui.notify("Chat bottom jump requires /powerline fixed-editor on", "warning");
-      return false;
-    }
-
-    return fixedEditorCompositor.jumpToRootBottom();
-  }
-
-  function followSubmittedEditorToBottom(): void {
-    fixedEditorCompositor?.jumpToRootBottom();
+    lastPromptRenderCache = { source: lastUserPrompt, compact, width, color, lines };
+    return lines;
   }
 
   function installPowerlineWidgets(ctx: any) {
-    ctx.ui.setWidget("powerline-status", () => ({
-      dispose() {},
-      invalidate() {
-        requestStatusRender();
-      },
-      render(width: number): string[] {
-        return renderPowerlineStatusLines(width);
-      },
-    }), { placement: "aboveEditor" });
+    if (!editorPerf.options.widgets) return;
+
+    // Web frontends such as pi-web bind extensions in "rpc" mode, render widget
+    // factories themselves, and show every widget as a panel even when it renders
+    // nothing. Outside the TUI only the primary bar has content to show.
+    const terminalWidgets = ctx.mode === "tui";
+
+    const measureWidget = (name: string, render: () => string[]): string[] => {
+      return editorPerf.options.enabled ? editorPerf.measure(`widget.${name}`, render) : render();
+    };
+
+    if (terminalWidgets) {
+      ctx.ui.setWidget("powerline-status", () => ({
+        dispose() {},
+        invalidate() {
+          requestStatusRender();
+        },
+        render(width: number): string[] {
+          return measureWidget("status", () => renderPowerlineStatusLines(width));
+        },
+      }), { placement: "aboveEditor" });
+    }
 
     ctx.ui.setWidget("powerline-top", (_tui: any, theme: Theme) => ({
       dispose() {},
@@ -2860,35 +3417,47 @@ export default function powerlineFooter(pi: ExtensionAPI) {
         resetLayoutCache();
       },
       render(width: number): string[] {
-        return renderPowerlinePrimaryLines(width, theme);
+        return measureWidget("primary", () => renderPowerlinePrimaryLines(width, theme));
       },
     }), { placement: config.placement === "below" ? "belowEditor" : "aboveEditor" });
 
-    ctx.ui.setWidget("powerline-secondary", (_tui: any, theme: Theme) => ({
-      dispose() {},
-      invalidate() {
-        resetLayoutCache();
-      },
-      render(width: number): string[] {
-        return renderPowerlineSecondaryLines(width, theme);
-      },
-    }), { placement: "belowEditor" });
+    if (!terminalWidgets) return;
 
-    ctx.ui.setWidget("powerline-bash-transcript", (_tui: any, theme: Theme) => ({
+    if (editorPerf.options.bashWidgets) {
+      ctx.ui.setWidget("powerline-bash-transcript", (_tui: any, theme: Theme) => ({
+        dispose() {},
+        invalidate() {},
+        render(width: number): string[] {
+          return measureWidget("bash-transcript", () => renderBashTranscriptLines(width, theme));
+        },
+      }), { placement: "belowEditor" });
+    }
+
+    ctx.ui.setWidget("powerline-pending-send", (_tui: any, theme: Theme) => ({
       dispose() {},
       invalidate() {},
       render(width: number): string[] {
-        return renderBashTranscriptLines(width, theme);
+        return renderPendingSendLines(width, theme);
       },
     }), { placement: "belowEditor" });
 
-    ctx.ui.setWidget("powerline-last-prompt", () => ({
+    ctx.ui.setWidget("powerline-queue-preview", (_tui: any, theme: Theme) => ({
       dispose() {},
       invalidate() {},
       render(width: number): string[] {
-        return renderLastPromptLines(width);
+        return measureWidget("queue-preview", () => renderPowerlineQueuePreviewLines(width, theme));
       },
     }), { placement: "belowEditor" });
+
+    if (editorPerf.options.lastPrompt) {
+      ctx.ui.setWidget("powerline-last-prompt", () => ({
+        dispose() {},
+        invalidate() {},
+        render(width: number): string[] {
+          return measureWidget("last-prompt", () => renderLastPromptLines(width));
+        },
+      }), { placement: "belowEditor" });
+    }
   }
 
   function setupCustomEditor(ctx: any) {
@@ -2905,7 +3474,7 @@ export default function powerlineFooter(pi: ExtensionAPI) {
         }
         if (isStashShortcutInput(data)) {
           stashOrRestoreEditorText(ctx);
-          scheduleDismissWelcome(ctx);
+          dismissWelcomeForInput(ctx);
           tuiRef?.requestRender();
           return { consume: true };
         }
@@ -2916,20 +3485,21 @@ export default function powerlineFooter(pi: ExtensionAPI) {
         }
 
         runPowerlineShortcut(ctx, powerlineShortcutAction);
-        scheduleDismissWelcome(ctx);
+        dismissWelcomeForInput(ctx);
         tuiRef?.requestRender();
         return { consume: true };
       })
       : null;
 
-    teardownFixedEditorCompositor();
     ctx.ui.setWidget("powerline-top", undefined);
     ctx.ui.setWidget("powerline-secondary", undefined);
     ctx.ui.setWidget("powerline-bash-transcript", undefined);
     ctx.ui.setWidget("powerline-status", undefined);
+    ctx.ui.setWidget("powerline-pending-send", undefined);
+    ctx.ui.setWidget("powerline-queue-preview", undefined);
     ctx.ui.setWidget("powerline-last-prompt", undefined);
 
-    let autocompleteFixed = false;
+    let autocompleteFixed = !bashModeSettings.completions;
     const previousEditorFactory = typeof ctx.ui.getEditorComponent === "function" ? ctx.ui.getEditorComponent() : undefined;
 
     const editorFactory = (tui: any, editorTheme: any, keybindings: any) => {
@@ -2942,7 +3512,6 @@ export default function powerlineFooter(pi: ExtensionAPI) {
           void setBashModeActive(false, ctx);
         },
         onSubmitCommand: (command) => void runShellCommand(command, ctx),
-        onEditorSubmit: () => followSubmittedEditorToBottom(),
         editorBoundaryShortcuts: {
           start: resolvedShortcuts.editorStart,
           end: resolvedShortcuts.editorEnd,
@@ -2953,6 +3522,7 @@ export default function powerlineFooter(pi: ExtensionAPI) {
         },
         onNotify: (message, level = "info") => ctx.ui.notify(message, level),
         getHistoryEntries: (prefix) => getShellHistoryEntries(prefix),
+        areCompletionsEnabled: () => bashModeSettings.completions,
         resolveGhostSuggestion: async (text, signal) => {
           const oneOffBash = getOneOffBashCommandContext(text);
           if (oneOffBash) {
@@ -2970,6 +3540,19 @@ export default function powerlineFooter(pi: ExtensionAPI) {
       });
 
       let installingPowerlineAutocompleteProvider = false;
+      // Pi assigns onSubmit after this factory returns and calls it from every submit path, so the delay wraps it here.
+      let piSubmit: ((text: string) => unknown) | undefined;
+      Object.defineProperty(editor, "onSubmit", {
+        configurable: true,
+        get: () => {
+          const submit = piSubmit;
+          return submit && ((text: string) => submitWithDelay(text, submit));
+        },
+        set: (handler: ((text: string) => unknown) | undefined) => {
+          piSubmit = handler;
+        },
+      });
+
       const originalSetAutocompleteProvider = editor.setAutocompleteProvider.bind(editor);
       editor.setAutocompleteProvider = (provider: AutocompleteProvider) => {
         if (installingPowerlineAutocompleteProvider) {
@@ -2986,6 +3569,7 @@ export default function powerlineFooter(pi: ExtensionAPI) {
       };
 
       const attachAutocompleteProvider = (): boolean => {
+        if (!bashModeSettings.completions) return false;
         if (editor.hasWrappedProvider()) return true;
         const defaultProvider = getInstalledAutocompleteProvider();
         if (!defaultProvider) return false;
@@ -3003,39 +3587,85 @@ export default function powerlineFooter(pi: ExtensionAPI) {
         return true;
       };
 
-      let inheritedOnSubmit: unknown;
-      Object.defineProperty(editor, "onSubmit", {
-        configurable: true,
-        get: () => inheritedOnSubmit,
-        set(handler: unknown) {
-          inheritedOnSubmit = typeof handler === "function"
-            ? (text: string) => {
-              followSubmittedEditorToBottom();
-              handler(text);
-            }
-            : handler;
-        },
-      });
-
       currentEditor = editor;
       trackPromptHistory(editor);
       restorePromptHistory(editor);
       attachAutocompleteProvider();
 
-      const originalHandleInput = editor.handleInput.bind(editor);
-      editor.handleInput = (data: string) => {
+      const baseHandleInput = editor.handleInput.bind(editor);
+      const originalHandleInput = editorPerf.options.enabled
+        ? (data: string) => editorPerf.measure("input.base-editor", () => baseHandleInput(data))
+        : baseHandleInput;
+      const handlePowerlineEditorInput = (data: string) => {
         lastEditorInputAt = Date.now();
+        dismissWelcomeForInput(ctx);
 
-        if (isStashShortcutInput(data)) {
+        if (isPrintableInput(data)) {
+          originalHandleInput(data);
+          return;
+        }
+
+        if (pendingSend && !bashModeActive && keybindings.matches(data, "app.interrupt") && !editor.isShowingAutocomplete()) {
+          restorePendingSend();
+          return;
+        }
+
+        const isSubmit = keybindings.matches(data, "tui.input.submit") && !keybindings.matches(data, "tui.input.newLine");
+        const isFollowUpSubmit = keybindings.matches(data, "app.message.followUp");
+        if (!powerlineCompacting && !bashModeActive && isSubmit && typeof ctx.compact === "function") {
+          const editorText = editor.getExpandedText().trim();
+          const compactQueuedPrompt = config.queue.compactPromptMode === "queue"
+            ? parseCompactQueuedPrompt(editorText)
+            : null;
+          if (editorText === "/compact" || compactQueuedPrompt) {
+            editor.addToHistory?.(editorText);
+            editor.setText("");
+            if (compactQueuedPrompt) {
+              capturePostCompactPrompt(ctx, compactQueuedPrompt);
+            }
+            powerlineCompacting = true;
+            cancelPostCompactionDelivery();
+            const generation = sessionGeneration;
+            const operation = ++compactionGeneration;
+            requestQueueRender();
+            ctx.compact({
+              onError: (error: Error) => {
+                // Preparation can fail before session_before_compact increments the operation.
+                if (generation !== sessionGeneration || compactionGeneration > operation + 1 || !powerlineCompacting) return;
+                finishFailedCompaction(ctx, error.message);
+                ctx.ui.notify(error.message, "error");
+              },
+            });
+            return;
+          }
+        }
+
+        if (powerlineCompacting && !bashModeActive && (isSubmit || isFollowUpSubmit)) {
+          const text = editor.getExpandedText().trim();
+          if (!text) {
+            sendPendingNow();
+            return;
+          }
+          if (text.startsWith("/")) {
+            originalHandleInput(data);
+            return;
+          }
+          editor.addToHistory?.(text);
+          editor.setText("");
+          capturePostCompactPrompt(ctx, text);
+          return;
+        }
+
+        // Ctrl+S is handled only here, where the editor has focus: Pi's
+        // selectors use it to save defaults and toggle session sort.
+        if (isStashShortcutInput(data) || matchesCtrlSStashInput(data)) {
           stashOrRestoreEditorText(ctx);
-          scheduleDismissWelcome(ctx);
           return;
         }
 
         const powerlineShortcutAction = getPowerlineShortcutAction(data);
         if (powerlineShortcutAction) {
           runPowerlineShortcut(ctx, powerlineShortcutAction);
-          scheduleDismissWelcome(ctx);
           return;
         }
 
@@ -3043,66 +3673,100 @@ export default function powerlineFooter(pi: ExtensionAPI) {
           autocompleteFixed = true;
           snapshotPromptHistory(editor);
           ctx.ui.setEditorComponent(editorFactory);
-          if (config.fixedEditor) {
-            installFixedEditorCompositor(ctx, tui);
-          }
           currentEditor?.handleInput(data);
           return;
         }
 
-        attachAutocompleteProvider();
-        const followUpText = keybindings.matches(data, "app.message.followUp") ? getCurrentEditorText(ctx, editor) : "";
-        scheduleDismissWelcome(ctx);
-        originalHandleInput(data);
-        if (hasNonWhitespaceText(followUpText) && !hasNonWhitespaceText(getCurrentEditorText(ctx, editor))) {
-          followSubmittedEditorToBottom();
+        if (bashModeSettings.completions) {
+          attachAutocompleteProvider();
         }
+        originalHandleInput(data);
       };
+      editor.handleInput = editorPerf.options.enabled
+        ? (data: string) => {
+            editorPerf.measure("input.total", () => handlePowerlineEditorInput(data));
+            const state = Reflect.get(editor, "state");
+            const lines = state && typeof state === "object" ? Reflect.get(state, "lines") : null;
+            if (Array.isArray(lines)) editorPerf.observeDraft(lines);
+          }
+        : handlePowerlineEditorInput;
 
       const originalRender = editor.render.bind(editor);
       editor.render = (width: number): string[] => {
-        if (width < 10) {
-          return originalRender(width);
-        }
-
-        const bc = (s: string) => `${getFgAnsiCode("sep")}${s}${ansi.reset}`;
-        const promptGlyph = bashModeActive ? "$" : ">";
-        const prompt = `${ansi.getFgAnsi(200, 200, 200)}${promptGlyph}${ansi.reset}`;
-        const promptPrefix = ` ${prompt} `;
-        const contPrefix = "   ";
-        const contentWidth = Math.max(1, width - 3);
-        const lines = originalRender(contentWidth);
-
-        if (lines.length === 0) return lines;
-
-        let bottomBorderIndex = lines.length - 1;
-        for (let i = lines.length - 1; i >= 1; i--) {
-          const stripped = lines[i]?.replace(/\x1b\[[0-9;]*m/g, "") || "";
-          if (stripped.length > 0 && /^─{3,}/.test(stripped)) {
-            bottomBorderIndex = i;
-            break;
+        const renderPowerlineEditor = (): string[] => {
+          if (!editorPerf.options.editorChrome) {
+            return editorPerf.options.enabled
+              ? editorPerf.measure("editor.render.base", () => originalRender(width))
+              : originalRender(width);
           }
-        }
 
-        const result: string[] = [];
-        result.push(" " + bc("─".repeat(width - 2)));
+          if (editorPerf.options.fastRender) {
+            const fastLines = editorPerf.options.enabled
+              ? editorPerf.measure("editor.render.fast-probe", () => renderFastPowerlineEditor(editor, width, {
+                  bashModeActive,
+                  completionsEnabled: bashModeSettings.completions,
+                }))
+              : renderFastPowerlineEditor(editor, width, {
+                  bashModeActive,
+                  completionsEnabled: bashModeSettings.completions,
+                });
+            if (fastLines) {
+              if (editorPerf.options.enabled) editorPerf.count("editor.render.fast-hit");
+              return fastLines;
+            }
+          }
 
-        for (let i = 1; i < bottomBorderIndex; i++) {
-          const prefix = i === 1 ? promptPrefix : contPrefix;
-          result.push(`${prefix}${lines[i] || ""}`);
-        }
+          if (width < 10) {
+            return editorPerf.options.enabled
+              ? editorPerf.measure("editor.render.base", () => originalRender(width))
+              : originalRender(width);
+          }
 
-        if (bottomBorderIndex === 1) {
-          result.push(`${promptPrefix}${" ".repeat(contentWidth)}`);
-        }
+          const promptGlyph = bashModeActive ? "$" : ">";
+          const promptColor = ansi.getFgAnsi(200, 200, 200);
+          const prompt = `${promptColor}${promptGlyph}${ansi.reset}`;
+          const promptPrefix = ` ${prompt} `;
+          const contPrefix = "   ";
+          const contentWidth = Math.max(1, width - 3);
+          const lines = editorPerf.options.enabled
+            ? editorPerf.measure("editor.render.base", () => originalRender(contentWidth))
+            : originalRender(contentWidth);
 
-        result.push(" " + bc("─".repeat(width - 2)));
+          if (lines.length === 0) return lines;
 
-        for (let i = bottomBorderIndex + 1; i < lines.length; i++) {
-          result.push(lines[i] || "");
-        }
+          let bottomBorderIndex = lines.length - 1;
+          for (let i = lines.length - 1; i >= 1; i--) {
+            const stripped = lines[i]?.replace(/\x1b\[[0-9;]*m/g, "") || "";
+            if (stripped.length > 0 && /^─{3,}/.test(stripped)) {
+              bottomBorderIndex = i;
+              break;
+            }
+          }
 
-        return result;
+          const result: string[] = [];
+          result.push(" " + colorEditorBorder(editor, "─".repeat(width - 2)));
+
+          for (let i = 1; i < bottomBorderIndex; i++) {
+            const prefix = i === 1 ? promptPrefix : contPrefix;
+            result.push(`${prefix}${lines[i] || ""}`);
+          }
+
+          if (bottomBorderIndex === 1) {
+            result.push(`${promptPrefix}${" ".repeat(contentWidth)}`);
+          }
+
+          result.push(" " + colorEditorBorder(editor, "─".repeat(width - 2)));
+
+          for (let i = bottomBorderIndex + 1; i < lines.length; i++) {
+            result.push(lines[i] || "");
+          }
+
+          return result;
+        };
+
+        return editorPerf.options.enabled
+          ? editorPerf.measure("editor.render.total", renderPowerlineEditor)
+          : renderPowerlineEditor();
       };
 
       return editor;
@@ -3110,143 +3774,167 @@ export default function powerlineFooter(pi: ExtensionAPI) {
 
     ctx.ui.setEditorComponent(editorFactory);
 
-    ctx.ui.setFooter((tui: any, _theme: Theme, footerData: ReadonlyFooterDataProvider) => {
+    ctx.ui.setFooter((tui: any, theme: Theme, footerData: ReadonlyFooterDataProvider) => {
       footerDataRef = footerData;
+      // Pi sets the provider cwd from sessionManager before binding session_start.
+      // Do not treat its branch as authoritative if the extension cwd differs.
+      footerDataCwd = ctx.sessionManager?.getCwd?.() ?? null;
       tuiRef = tui;
       installFooterStatusRepaintHook(footerData);
-      const unsub = footerData.onBranchChange(() => requestStatusRender());
+      const unsub = footerData.onBranchChange(() => {
+        invalidateGitStatus();
+        invalidateGitBranch();
+        requestStatusRender();
+      });
+      const unsubGitUpdates = subscribeGitUpdates(() => requestStatusRender());
 
       return {
         dispose() {
           unsub();
+          unsubGitUpdates();
+          footerDataRef = null;
+          footerDataCwd = null;
           restoreFooterStatusRepaintHook?.();
           restoreFooterStatusRepaintHook = null;
         },
         invalidate() {
           requestStatusRender();
         },
-        render(): string[] {
-          return [];
+        render(width: number): string[] {
+          return renderPowerlineSecondaryLines(width, theme);
         },
       };
     });
 
-    if (config.fixedEditor) {
-      if (tuiRef) {
-        installFixedEditorCompositor(ctx, tuiRef);
-      }
-    } else {
-      installPowerlineWidgets(ctx);
-    }
+    installPowerlineWidgets(ctx);
+  }
+
+  function beginWelcomeRequest(ctx: any): AbortController {
+    dismissWelcome(ctx);
+    welcomeRequest = new AbortController();
+    return welcomeRequest;
+  }
+
+  function canShowWelcome(ctx: any, request: AbortController, generation: number): boolean {
+    if (request !== welcomeRequest || request.signal.aborted || generation !== sessionGeneration
+      || !enabled || !config.welcome || !ctx.hasUI || isStreaming
+      || ctx.ui.getEditorText()) return false;
+    const sessionEvents = ctx.sessionManager?.getBranch?.() ?? [];
+    return !sessionEvents.some((entry: unknown) => {
+      if (!isRecord(entry)) return false;
+      if (entry.type === "tool_call" || entry.type === "tool_result") return true;
+      return entry.type === "message" && isRecord(entry.message) && entry.message.role === "assistant";
+    });
   }
 
   function setupWelcomeHeader(ctx: any) {
-    const modelName = ctx.model?.name || ctx.model?.id || "No model";
-    const providerName = ctx.model?.provider || "Unknown";
-    const loadedCounts = discoverLoadedCounts();
-    const recentSessions = getRecentSessions(3);
-    const initialContextTokens = estimateInitialContextTokens(ctx);
-    
-    const header = new WelcomeHeader(modelName, providerName, recentSessions, loadedCounts, initialContextTokens);
-    welcomeHeaderActive = true;
-    
-    ctx.ui.setHeader(() => {
-      return {
-        render(width: number): string[] {
-          return header.render(width);
-        },
-        invalidate() {
-          header.invalidate();
-        },
-      };
-    });
+    const request = beginWelcomeRequest(ctx);
+    const generation = sessionGeneration;
+    // Keep optional archive discovery off the session_start completion path.
+    welcomeTimer = setTimeout(async () => {
+      welcomeTimer = null;
+      try {
+        if (!canShowWelcome(ctx, request, generation)) return;
+        const recentSessions = await getRecentSessions(3, request.signal);
+        if (!canShowWelcome(ctx, request, generation)) return;
+        const modelName = ctx.model?.name || ctx.model?.id || "No model";
+        const providerName = ctx.model?.provider || "Unknown";
+        const loadedCounts = discoverLoadedCounts(pi.getCommands());
+        const initialContextTokens = estimateInitialContextTokens(ctx);
+
+        const header = new WelcomeHeader(modelName, providerName, recentSessions, loadedCounts, initialContextTokens);
+        welcomeHeaderActive = true;
+        ctx.ui.setHeader(() => header);
+      } catch (error: unknown) {
+        if (!request.signal.aborted || error !== request.signal.reason) {
+          console.debug("[pi-power-user] Welcome header failed:", error);
+        }
+      }
+    }, 0);
   }
 
   function setupWelcomeOverlay(ctx: any) {
+    const request = beginWelcomeRequest(ctx);
     const modelName = ctx.model?.name || ctx.model?.id || "No model";
     const providerName = ctx.model?.provider || "Unknown";
-    const loadedCounts = discoverLoadedCounts();
-    const recentSessions = getRecentSessions(3);
-    
+
     const overlaySessionGeneration = sessionGeneration;
 
     // Small delay to let pi-mono finish initialization
-    setTimeout(() => {
-      if (!enabled || welcomeOverlayShouldDismiss || isStreaming || overlaySessionGeneration !== sessionGeneration) {
-        welcomeOverlayShouldDismiss = false;
-        return;
-      }
-      
-      const sessionEvents = ctx.sessionManager?.getBranch?.() ?? [];
-      const hasActivity = sessionEvents.some((entry: unknown) => {
-        if (!isRecord(entry)) return false;
-        if (entry.type === "tool_call" || entry.type === "tool_result") return true;
-        return entry.type === "message" && isRecord(entry.message) && entry.message.role === "assistant";
-      });
-      if (hasActivity) {
-        return;
-      }
+    welcomeTimer = setTimeout(async () => {
+      welcomeTimer = null;
+      try {
+        if (!canShowWelcome(ctx, request, overlaySessionGeneration)) return;
+        const recentSessions = await getRecentSessions(3, request.signal);
+        if (!canShowWelcome(ctx, request, overlaySessionGeneration)) return;
+        const loadedCounts = discoverLoadedCounts(pi.getCommands());
+        const initialContextTokens = estimateInitialContextTokens(ctx);
 
-      const initialContextTokens = estimateInitialContextTokens(ctx);
-      
-      ctx.ui.custom(
-        (tui: any, _theme: any, _keybindings: any, done: (result: void) => void) => {
-          const welcome = new WelcomeComponent(
-            modelName,
-            providerName,
-            recentSessions,
-            loadedCounts,
-            initialContextTokens,
-          );
-          
-          let countdown = 30;
-          let dismissed = false;
-          let interval: ReturnType<typeof setInterval> | null = null;
-          
-          const dismiss = () => {
-            if (dismissed) return;
-            dismissed = true;
-            if (interval) clearInterval(interval);
-            dismissWelcomeOverlay = null;
-            done();
-          };
-          
-          interval = setInterval(() => {
-            if (dismissed) return;
-            countdown--;
-            welcome.setCountdown(countdown);
-            tui.requestRender();
-            if (countdown <= 0) dismiss();
-          }, 1000);
+        void ctx.ui.custom(
+          (tui: any, _theme: any, _keybindings: any, done: (result: void) => void) => {
+            if (!canShowWelcome(ctx, request, overlaySessionGeneration)) {
+              done();
+              return { render: () => [], invalidate() {} };
+            }
+            const welcome = new WelcomeComponent(
+              modelName,
+              providerName,
+              recentSessions,
+              loadedCounts,
+              initialContextTokens,
+            );
 
-          dismissWelcomeOverlay = dismiss;
+            let countdown = 30;
+            let dismissed = false;
+            let interval: ReturnType<typeof setInterval> | null = null;
 
-          if (welcomeOverlayShouldDismiss) {
-            welcomeOverlayShouldDismiss = false;
-            dismiss();
-          }
-
-          return {
-            focused: false,
-            invalidate: () => welcome.invalidate(),
-            render: (width: number) => welcome.render(width),
-            handleInput: () => dismiss(),
-            dispose: () => {
+            const dismiss = () => {
+              if (dismissed) return;
               dismissed = true;
               if (interval) clearInterval(interval);
-            },
-          };
-        },
-        {
-          overlay: true,
-          overlayOptions: () => ({
-            verticalAlign: "center",
-            horizontalAlign: "center",
-          }),
-        },
-      ).catch((error) => {
-        console.debug("[pi-power-user] Welcome overlay failed:", error);
-      });
+              request.abort();
+              if (welcomeRequest === request) welcomeRequest = null;
+              dismissWelcomeOverlay = null;
+              done();
+            };
+
+            interval = setInterval(() => {
+              if (dismissed) return;
+              countdown--;
+              welcome.setCountdown(countdown);
+              tui.requestRender();
+              if (countdown <= 0) dismiss();
+            }, 1000);
+
+            dismissWelcomeOverlay = dismiss;
+
+            return {
+              focused: false,
+              wantsKeyRelease: true,
+              invalidate: () => welcome.invalidate(),
+              render: (width: number) => welcome.render(width),
+              handleInput: (data: string) => {
+                dismiss();
+                if (!isKeyRelease(data)) currentEditor?.handleInput(data);
+              },
+              dispose: dismiss,
+            };
+          },
+          {
+            overlay: true,
+            overlayOptions: () => ({
+              verticalAlign: "center",
+              horizontalAlign: "center",
+            }),
+          },
+        ).catch((error: unknown) => {
+          console.debug("[pi-power-user] Welcome overlay failed:", error);
+        });
+      } catch (error: unknown) {
+        if (!request.signal.aborted || error !== request.signal.reason) {
+          console.debug("[pi-power-user] Welcome overlay failed:", error);
+        }
+      }
     }, 100);
   }
 }

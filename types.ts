@@ -1,8 +1,9 @@
 import type { Theme, ThemeColor } from "@earendil-works/pi-coding-agent";
+import type { CostCurrencyCode } from "./currency-rates.ts";
 import type { SubscriptionUsage } from "./subscription-usage.ts";
 
-// Theme color - either a pi theme color name or a custom hex color
-export type ColorValue = ThemeColor | `#${string}`;
+// Theme color - a pi theme color name, a custom hex color, or the rainbow effect
+export type ColorValue = ThemeColor | `#${string}` | "rainbow";
 export type ThemeLike = Pick<Theme, "fg">;
 
 // Semantic color names for segments
@@ -17,11 +18,14 @@ export type SemanticColor =
   | "thinkingLow"
   | "thinkingMedium"
   | "thinkingHigh"
+  | "thinkingXhigh"
+  | "thinkingMax"
   | "context"
   | "contextWarn"
   | "contextError"
   | "cost"
   | "tokens"
+  | "queue"
   | "separator"
   | "border";
 
@@ -35,6 +39,7 @@ export const BUILTIN_STATUS_LINE_SEGMENT_IDS = [
   "path",
   "git",
   "subagents",
+  "queue",
   "token_in",
   "token_out",
   "token_total",
@@ -98,9 +103,9 @@ export interface StatusLineSegmentOptions {
     hostIcon?: boolean;
   };
   time?: { format?: "12h" | "24h"; showSeconds?: boolean };
-  cost?: { subscriptionDisplay?: "subscription" | "reported-cost" | "both" };
+  cost?: { subscriptionDisplay?: "subscription" | "reported-cost" | "both"; currency?: CostCurrencyCode };
   context?: { format?: "full" | "percent" };
-  cache_read?: { format?: "tokens" | "percent" };
+  cache_read?: { format?: "tokens" | "percent" | "both" };
 }
 
 export type CustomItemPosition = "left" | "right" | "secondary";
@@ -116,6 +121,7 @@ export interface CustomStatusItem {
   statusKey: string;
   position: CustomItemPosition;
   color?: ColorValue;
+  selfColorize: boolean;
   prefix?: string;
   hideWhenMissing: boolean;
   excludeFromExtensionStatuses: boolean;
@@ -153,12 +159,23 @@ export interface GitStatus {
 }
 
 // Usage statistics
+export interface QueueSummary {
+  queueCount: number;
+  blockedCount: number;
+  compacting: boolean;
+  leadingText: string | null;
+  leadingIntent: "steer" | "follow-up" | "post-compact" | null;
+  leadingStatus: "queued" | "blocked" | "delivering" | "sent" | "failed" | null;
+}
+
 export interface UsageStats {
   input: number;
   output: number;
   cacheRead: number;
   cacheWrite: number;
   cost: number;
+  // Cumulative cost of subagent child runs (e.g. /parallel, /worker) launched from this session.
+  subagentCost: number;
 }
 
 // Context passed to segment render functions
@@ -175,17 +192,20 @@ export interface SegmentContext {
   } | undefined;
   thinkingLevel: string;
   sessionId: string | undefined;
+  sessionName?: string;
   cwd?: string;
   
   // Computed
   usageStats: UsageStats;
-  contextTokens: number;
-  contextPercent: number;
+  contextTokens: number | null;
+  contextPercent: number | null;
   contextWindow: number;
+  contextApproximate: boolean;
   autoCompactEnabled: boolean;
   customCompactionEnabled: boolean;
   usingSubscription: boolean;
   subscriptionUsage: SubscriptionUsage | null;
+  queueSummary: QueueSummary;
   sessionStartTime: number;
   shellModeActive: boolean;
   shellRunning: boolean;

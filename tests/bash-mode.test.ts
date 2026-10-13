@@ -1,8 +1,10 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
+import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { pathToFileURL } from "node:url";
 import { appendProjectHistory, matchHistoryEntries, readGlobalShellHistory } from "../bash-mode/history.ts";
 import { BashTranscriptStore } from "../bash-mode/transcript.ts";
 import {
@@ -22,6 +24,20 @@ function getMethod(target: object, name: string): Function {
     throw new Error(`Expected ${name} to be a function`);
   }
   return method;
+}
+
+function resolveManagedShellPath(): string | null {
+  for (const shellPath of ["/bin/zsh", "/bin/bash"]) {
+    if (existsSync(shellPath)) return shellPath;
+  }
+  return null;
+}
+
+// pi-coding-agent ships an npm shrinkwrap, so npm may install its own pi-tui copy.
+// Resolve pi-tui through pi-coding-agent so module-level mutations affect the same instance its editor uses.
+function resolvePiTuiModuleUrl(subpath: string): string {
+  const requireFromCodingAgent = createRequire(join(process.cwd(), "node_modules", "@earendil-works", "pi-coding-agent", "package.json"));
+  return pathToFileURL(requireFromCodingAgent.resolve(`@earendil-works/pi-tui/${subpath}`)).href;
 }
 
 function ensureEditorModuleLinks(): { cleanup: () => void } {
@@ -75,6 +91,38 @@ test("project history is stored newest-first and global zsh history parses histf
 
   const global = readGlobalShellHistory("/bin/zsh");
   assert.deepEqual(global, ["plain-command", "git pull", "git fetch"]);
+});
+
+test("global history caches an unreadable file until its fingerprint changes", () => {
+  const cwd = mkdtempSync(join(tmpdir(), "powerline-unreadable-history-"));
+  const historyPath = join(cwd, ".zsh_history");
+  const originalHistfile = process.env.HISTFILE;
+  const originalDebug = console.debug;
+  let debugCalls = 0;
+
+  try {
+    mkdirSync(historyPath);
+    process.env.HISTFILE = historyPath;
+    console.debug = () => {
+      debugCalls += 1;
+    };
+
+    assert.deepEqual(readGlobalShellHistory("/bin/zsh"), []);
+    assert.deepEqual(readGlobalShellHistory("/bin/zsh"), []);
+    assert.equal(debugCalls, 1);
+
+    rmSync(historyPath, { recursive: true });
+    writeFileSync(historyPath, ": 1711111111:0;git status\n");
+    assert.deepEqual(readGlobalShellHistory("/bin/zsh"), ["git status"]);
+  } finally {
+    console.debug = originalDebug;
+    if (originalHistfile === undefined) {
+      delete process.env.HISTFILE;
+    } else {
+      process.env.HISTFILE = originalHistfile;
+    }
+    rmSync(cwd, { recursive: true, force: true });
+  }
 });
 
 test("matchHistoryEntries returns newest entries when the prefix is empty", () => {
@@ -473,12 +521,18 @@ test("deterministic path completion handles bash argument position", async () =>
   assert.equal(suggestion?.source, "path");
 });
 
-test("managed shell session preserves cwd changes across commands", async () => {
+test("managed shell session preserves cwd changes across commands", async (t) => {
+  const shellPath = resolveManagedShellPath();
+  if (!shellPath) {
+    t.skip("requires zsh or bash");
+    return;
+  }
+
   const cwd = mkdtempSync(join(tmpdir(), "powerline-shell-"));
   const childDir = join(cwd, "child");
   mkdirSync(childDir, { recursive: true });
   const store = new BashTranscriptStore({ transcriptMaxLines: 100, transcriptMaxBytes: 64 * 1024 });
-  const session = new ManagedShellSession("/bin/zsh", cwd, store, () => {}, () => {});
+  const session = new ManagedShellSession(shellPath, cwd, store, () => {}, () => {});
 
   try {
     await session.ensureReady();
@@ -505,10 +559,16 @@ test("managed shell session preserves cwd changes across commands", async () => 
   }
 });
 
-test("managed shell session recovers cleanly after interrupt", async () => {
+test("managed shell session recovers cleanly after interrupt", async (t) => {
+  const shellPath = resolveManagedShellPath();
+  if (!shellPath) {
+    t.skip("requires zsh or bash");
+    return;
+  }
+
   const cwd = mkdtempSync(join(tmpdir(), "powerline-shell-interrupt-"));
   const store = new BashTranscriptStore({ transcriptMaxLines: 100, transcriptMaxBytes: 64 * 1024 });
-  const session = new ManagedShellSession("/bin/zsh", cwd, store, () => {}, () => {});
+  const session = new ManagedShellSession(shellPath, cwd, store, () => {}, () => {});
 
   const waitForCommand = async () => {
     const start = Date.now();
@@ -684,7 +744,12 @@ test("bash editor refreshes shell ghost state after a bracketed paste completes"
   }
 });
 
-test("bash editor inserts Finder file drops as path strings", async () => {
+test("bash editor inserts Finder file drops as path strings", async (t) => {
+  if (process.platform === "win32") {
+    t.skip("Finder file drops are macOS/POSIX paths");
+    return;
+  }
+
   const links = ensureEditorModuleLinks();
 
   try {
@@ -756,28 +821,26 @@ test("one-off bash autocomplete provider stays inactive even inside bang command
   assert.equal(suggestions, null);
 });
 
-test("bash autocomplete providers return null synchronously in shell contexts", () => {
+test("bash autocomplete providers return null in shell contexts", async () => {
   const signal = new AbortController().signal;
 
-  const bashSuggestions = new BashAutocompleteProvider().getSuggestions(["git st"], 0, 6, { signal });
-  const oneOffSuggestions = new OneOffBashAutocompleteProvider().getSuggestions(["!git st"], 0, 7, { signal });
+  const bashSuggestions = await new BashAutocompleteProvider().getSuggestions(["git st"], 0, 6, { signal });
+  const oneOffSuggestions = await new OneOffBashAutocompleteProvider().getSuggestions(["!git st"], 0, 7, { signal });
 
   assert.equal(bashSuggestions, null);
   assert.equal(oneOffSuggestions, null);
-  assert.equal(bashSuggestions instanceof Promise, false);
-  assert.equal(oneOffSuggestions instanceof Promise, false);
 });
 
-test("mode-aware autocomplete provider preserves synchronous default results", () => {
+test("mode-aware autocomplete provider preserves default results", async () => {
   const signal = new AbortController().signal;
-  const syncResult = {
+  const result = {
     items: [{ value: "status", label: "status" }],
     prefix: "st",
   };
   const provider = new ModeAwareAutocompleteProvider(
     {
-      getSuggestions() {
-        return syncResult;
+      async getSuggestions() {
+        return result;
       },
       applyCompletion(lines: string[], cursorLine: number, cursorCol: number) {
         return { lines, cursorLine, cursorCol };
@@ -788,10 +851,9 @@ test("mode-aware autocomplete provider preserves synchronous default results", (
     () => false,
   );
 
-  const suggestions = provider.getSuggestions(["st"], 0, 2, { signal });
+  const suggestions = await provider.getSuggestions(["st"], 0, 2, { signal });
 
-  assert.equal(suggestions, syncResult);
-  assert.equal(suggestions instanceof Promise, false);
+  assert.equal(suggestions, result);
 });
 
 test("one-off bash autocomplete provider stays inactive before the bang command starts", async () => {
@@ -812,12 +874,533 @@ test("bash editor refreshGhostSuggestion reuses the ghost scheduling path", asyn
     let scheduled = false;
 
     getMethod(BashModeEditor.prototype, "refreshGhostSuggestion").call({
+      areCompletionsEnabled() {
+        return true;
+      },
       scheduleGhostUpdate() {
         scheduled = true;
       },
     });
 
     assert.equal(scheduled, true);
+  } finally {
+    links.cleanup();
+  }
+});
+
+test("bash editor refreshGhostSuggestion clears ghosts when completions are disabled", async () => {
+  const links = ensureEditorModuleLinks();
+
+  try {
+    const { BashModeEditor } = await import("../bash-mode/editor.ts");
+    let cleared = false;
+    let scheduled = false;
+
+    getMethod(BashModeEditor.prototype, "refreshGhostSuggestion").call({
+      areCompletionsEnabled() {
+        return false;
+      },
+      clearGhostSuggestion() {
+        cleared = true;
+      },
+      scheduleGhostUpdate() {
+        scheduled = true;
+      },
+    });
+
+    assert.equal(cleared, true);
+    assert.equal(scheduled, false);
+  } finally {
+    links.cleanup();
+  }
+});
+
+test("bash editor hot path avoids full expansion and coalesces ghost work", async () => {
+  const links = ensureEditorModuleLinks();
+
+  try {
+    const { BashModeEditor } = await import("../bash-mode/editor.ts");
+    const { KeybindingsManager } = await import(new URL("../node_modules/@earendil-works/pi-coding-agent/dist/core/keybindings.js", import.meta.url).href);
+    const keybindings = KeybindingsManager.create();
+    const resolved: string[] = [];
+    let bashModeActive = false;
+    const editor = new BashModeEditor(
+      { requestRender() {}, terminal: { columns: 80, rows: 24 } },
+      { borderColor: (text: string) => text },
+      keybindings,
+      {
+        keybindings,
+        isBashModeActive: () => bashModeActive,
+        isShellRunning: () => false,
+        onExitBashMode() {},
+        onSubmitCommand() {},
+        onInterrupt() {},
+        onNotify() {},
+        getHistoryEntries: () => [],
+        resolveGhostSuggestion: async (text) => {
+          resolved.push(text);
+          return null;
+        },
+      },
+    );
+
+    (editor as { getExpandedText(): string }).getExpandedText = () => {
+      throw new Error("expanded text should not be read while typing");
+    };
+    const insertCharacter = Reflect.get(editor, "insertCharacter").bind(editor);
+    let fastInserts = 0;
+    Reflect.set(editor, "insertCharacter", (character: string) => {
+      fastInserts += 1;
+      insertCharacter(character);
+    });
+
+    for (const character of ["a", "A", ".", "漢", "🙂"]) editor.handleInput(character);
+    assert.equal(editor.getText(), "aA.漢🙂");
+    assert.equal(fastInserts, 5);
+    editor.onExtensionShortcut = (data) => data === "b";
+    editor.handleInput("b");
+    assert.equal(editor.getText(), "aA.漢🙂");
+    assert.equal(fastInserts, 5);
+    editor.onExtensionShortcut = undefined;
+    editor.render(80);
+
+    bashModeActive = true;
+    editor.setText("");
+    editor.handleInput("g");
+    editor.handleInput("i");
+    editor.handleInput("t");
+    assert.deepEqual(resolved, []);
+    await new Promise((resolve) => setTimeout(resolve, 75));
+    assert.deepEqual(resolved, ["git"]);
+    editor.clearGhostSuggestion();
+
+  } finally {
+    links.cleanup();
+  }
+});
+
+test("bash editor long ASCII backspace keeps undo without scanning the full line", async () => {
+  const links = ensureEditorModuleLinks();
+
+  try {
+    const { BashModeEditor } = await import("../bash-mode/editor.ts");
+    const { KeybindingsManager } = await import(new URL("../node_modules/@earendil-works/pi-coding-agent/dist/core/keybindings.js", import.meta.url).href);
+    const keybindings = KeybindingsManager.create();
+    const editor = new BashModeEditor(
+      { requestRender() {}, terminal: { columns: 80, rows: 24 } },
+      { borderColor: (text: string) => text },
+      keybindings,
+      {
+        keybindings,
+        isBashModeActive: () => false,
+        isShellRunning: () => false,
+        onExitBashMode() {},
+        onSubmitCommand() {},
+        onInterrupt() {},
+        onNotify() {},
+        getHistoryEntries: () => [],
+        resolveGhostSuggestion: async () => null,
+      },
+    );
+    const original = "x".repeat(5000);
+    editor.setText(original);
+    Reflect.get(editor, "undoStack").clear();
+    const segment = Reflect.get(editor, "segment").bind(editor);
+    Reflect.set(editor, "segment", () => {
+      throw new Error("long ASCII backspace must not segment the full line");
+    });
+
+    editor.handleInput("\x7f");
+    assert.equal(editor.getText(), original.slice(0, -1));
+
+    editor.handleInput("\x1b[122;9u");
+    assert.equal(editor.getText(), original);
+
+    Reflect.set(editor, "segment", segment);
+    editor.setText(`${"x".repeat(4998)}\u0600a`);
+    editor.handleInput("\x7f");
+    assert.equal(editor.getText(), "x".repeat(4998));
+  } finally {
+    links.cleanup();
+  }
+});
+
+test("bash editor long ASCII backspace preserves custom app bindings by input sequence", async () => {
+  const links = ensureEditorModuleLinks();
+
+  try {
+    const { BashModeEditor } = await import("../bash-mode/editor.ts");
+    const { KeybindingsManager } = await import(new URL("../node_modules/@earendil-works/pi-coding-agent/dist/core/keybindings.js", import.meta.url).href);
+    const keybindings = new KeybindingsManager({ "app.clear": "ctrl+h" });
+    const editor = new BashModeEditor(
+      { requestRender() {}, terminal: { columns: 80, rows: 24 } },
+      { borderColor: (text: string) => text },
+      keybindings,
+      {
+        keybindings,
+        isBashModeActive: () => false,
+        isShellRunning: () => false,
+        onExitBashMode() {},
+        onSubmitCommand() {},
+        onInterrupt() {},
+        onNotify() {},
+        getHistoryEntries: () => [],
+        resolveGhostSuggestion: async () => null,
+      },
+    );
+    let cleared = false;
+    editor.onAction("app.clear", () => {
+      cleared = true;
+    });
+    const original = "x".repeat(5000);
+    editor.setText(original);
+
+    editor.handleInput("\x7f");
+    assert.equal(editor.getText(), original.slice(0, -1));
+    assert.equal(cleared, false);
+
+    editor.handleInput("\x08");
+    assert.equal(cleared, true);
+    assert.equal(editor.getText(), original.slice(0, -1));
+  } finally {
+    links.cleanup();
+  }
+});
+
+test("bash editor long ASCII forward delete keeps undo without scanning the full line", async () => {
+  const links = ensureEditorModuleLinks();
+
+  try {
+    const { BashModeEditor } = await import("../bash-mode/editor.ts");
+    const { KeybindingsManager } = await import(new URL("../node_modules/@earendil-works/pi-coding-agent/dist/core/keybindings.js", import.meta.url).href);
+    const keybindings = KeybindingsManager.create();
+    const editor = new BashModeEditor(
+      { requestRender() {}, terminal: { columns: 80, rows: 24 } },
+      { borderColor: (text: string) => text },
+      keybindings,
+      {
+        keybindings,
+        isBashModeActive: () => false,
+        isShellRunning: () => false,
+        onExitBashMode() {},
+        onSubmitCommand() {},
+        onInterrupt() {},
+        onNotify() {},
+        getHistoryEntries: () => [],
+        areCompletionsEnabled: () => false,
+        resolveGhostSuggestion: async () => null,
+      },
+    );
+    const original = "x".repeat(5000);
+    editor.setText(original);
+    Reflect.set(Reflect.get(editor, "state"), "cursorCol", 2500);
+    Reflect.get(editor, "undoStack").clear();
+    const segment = Reflect.get(editor, "segment").bind(editor);
+    Reflect.set(editor, "segment", () => {
+      throw new Error("long ASCII forward delete must not segment the full line");
+    });
+
+    editor.handleInput("\x1b[3~");
+    assert.equal(editor.getText(), `${"x".repeat(4999)}`);
+    assert.deepEqual(editor.getCursor(), { line: 0, col: 2500 });
+
+    editor.handleInput("\x1b[122;9u");
+    assert.equal(editor.getText(), original);
+    assert.deepEqual(editor.getCursor(), { line: 0, col: 2500 });
+
+    Reflect.set(editor, "segment", segment);
+    editor.setText(`${"x".repeat(2499)}\u0600a${"x".repeat(2500)}`);
+    Reflect.set(Reflect.get(editor, "state"), "cursorCol", 2499);
+    editor.handleInput("\x1b[3~");
+    assert.equal(editor.getText(), `${"x".repeat(2499)}${"x".repeat(2500)}`);
+  } finally {
+    links.cleanup();
+  }
+});
+
+test("bash editor long ASCII forward delete preserves custom app bindings by input sequence", async () => {
+  const links = ensureEditorModuleLinks();
+
+  try {
+    const { BashModeEditor } = await import("../bash-mode/editor.ts");
+    const { KeybindingsManager } = await import(new URL("../node_modules/@earendil-works/pi-coding-agent/dist/core/keybindings.js", import.meta.url).href);
+    const keybindings = new KeybindingsManager({ "app.clear": "ctrl+d" });
+    const editor = new BashModeEditor(
+      { requestRender() {}, terminal: { columns: 80, rows: 24 } },
+      { borderColor: (text: string) => text },
+      keybindings,
+      {
+        keybindings,
+        isBashModeActive: () => false,
+        isShellRunning: () => false,
+        onExitBashMode() {},
+        onSubmitCommand() {},
+        onInterrupt() {},
+        onNotify() {},
+        getHistoryEntries: () => [],
+        areCompletionsEnabled: () => false,
+        resolveGhostSuggestion: async () => null,
+      },
+    );
+    let cleared = false;
+    editor.onAction("app.clear", () => {
+      cleared = true;
+    });
+    editor.setText("x".repeat(5000));
+    Reflect.set(Reflect.get(editor, "state"), "cursorCol", 2500);
+
+    editor.handleInput("\x1b[3~");
+    assert.equal(editor.getText(), "x".repeat(4999));
+    assert.deepEqual(editor.getCursor(), { line: 0, col: 2500 });
+    assert.equal(cleared, false);
+
+    editor.handleInput("\x04");
+    assert.equal(cleared, true);
+    assert.equal(editor.getText(), "x".repeat(4999));
+  } finally {
+    links.cleanup();
+  }
+});
+
+test("bash editor long ASCII horizontal movement avoids visual remapping", async () => {
+  const links = ensureEditorModuleLinks();
+
+  try {
+    const { BashModeEditor } = await import("../bash-mode/editor.ts");
+    const { KeybindingsManager } = await import(new URL("../node_modules/@earendil-works/pi-coding-agent/dist/core/keybindings.js", import.meta.url).href);
+    const keybindings = KeybindingsManager.create();
+    const editor = new BashModeEditor(
+      { requestRender() {}, terminal: { columns: 80, rows: 24 } },
+      { borderColor: (text: string) => text },
+      keybindings,
+      {
+        keybindings,
+        isBashModeActive: () => false,
+        isShellRunning: () => false,
+        onExitBashMode() {},
+        onSubmitCommand() {},
+        onInterrupt() {},
+        onNotify() {},
+        getHistoryEntries: () => [],
+        areCompletionsEnabled: () => false,
+        resolveGhostSuggestion: async () => null,
+      },
+    );
+    editor.setText("x".repeat(5000));
+    Reflect.set(editor, "buildVisualLineMap", () => {
+      throw new Error("long ASCII horizontal movement must not rebuild visual lines");
+    });
+
+    editor.handleInput("\x1b[D");
+    assert.deepEqual(editor.getCursor(), { line: 0, col: 4999 });
+    editor.handleInput("\x1b[C");
+    assert.deepEqual(editor.getCursor(), { line: 0, col: 5000 });
+  } finally {
+    links.cleanup();
+  }
+});
+
+test("bash editor long ASCII horizontal movement preserves custom app bindings by input sequence", async () => {
+  const links = ensureEditorModuleLinks();
+
+  try {
+    const { BashModeEditor } = await import("../bash-mode/editor.ts");
+    const { KeybindingsManager } = await import(new URL("../node_modules/@earendil-works/pi-coding-agent/dist/core/keybindings.js", import.meta.url).href);
+    const keybindings = new KeybindingsManager({ "app.clear": "ctrl+b" });
+    const editor = new BashModeEditor(
+      { requestRender() {}, terminal: { columns: 80, rows: 24 } },
+      { borderColor: (text: string) => text },
+      keybindings,
+      {
+        keybindings,
+        isBashModeActive: () => false,
+        isShellRunning: () => false,
+        onExitBashMode() {},
+        onSubmitCommand() {},
+        onInterrupt() {},
+        onNotify() {},
+        getHistoryEntries: () => [],
+        areCompletionsEnabled: () => false,
+        resolveGhostSuggestion: async () => null,
+      },
+    );
+    let cleared = false;
+    editor.onAction("app.clear", () => {
+      cleared = true;
+    });
+    editor.setText("x".repeat(5000));
+
+    editor.handleInput("\x1b[D");
+    assert.deepEqual(editor.getCursor(), { line: 0, col: 4999 });
+    assert.equal(cleared, false);
+
+    editor.handleInput("\x02");
+    assert.equal(cleared, true);
+    assert.deepEqual(editor.getCursor(), { line: 0, col: 4999 });
+  } finally {
+    links.cleanup();
+  }
+});
+
+test("bash editor horizontal fast path resets shell history browsing", async () => {
+  const links = ensureEditorModuleLinks();
+
+  try {
+    const { BashModeEditor } = await import("../bash-mode/editor.ts");
+    const { KeybindingsManager } = await import(new URL("../node_modules/@earendil-works/pi-coding-agent/dist/core/keybindings.js", import.meta.url).href);
+    const keybindings = KeybindingsManager.create();
+    const historyCommand = "x".repeat(5000);
+    const editor = new BashModeEditor(
+      { requestRender() {}, terminal: { columns: 80, rows: 24 } },
+      { borderColor: (text: string) => text },
+      keybindings,
+      {
+        keybindings,
+        isBashModeActive: () => true,
+        isShellRunning: () => false,
+        onExitBashMode() {},
+        onSubmitCommand() {},
+        onInterrupt() {},
+        onNotify() {},
+        getHistoryEntries: (prefix: string) => prefix === "draft" ? [historyCommand] : [],
+        areCompletionsEnabled: () => false,
+        resolveGhostSuggestion: async () => null,
+      },
+    );
+    editor.setText("draft");
+    editor.handleInput("\x1b[A");
+    assert.equal(editor.getText(), historyCommand);
+
+    editor.handleInput("\x1b[D");
+    editor.handleInput("\x1b[B");
+
+    assert.equal(editor.getText(), historyCommand);
+    assert.deepEqual(editor.getCursor(), { line: 0, col: 4999 });
+    assert.equal(Reflect.get(editor, "shellHistoryIndex"), -1);
+  } finally {
+    links.cleanup();
+  }
+});
+
+test("bash editor horizontal fast path falls back with active paste markers", async () => {
+  const links = ensureEditorModuleLinks();
+
+  try {
+    const { BashModeEditor } = await import("../bash-mode/editor.ts");
+    const { KeybindingsManager } = await import(new URL("../node_modules/@earendil-works/pi-coding-agent/dist/core/keybindings.js", import.meta.url).href);
+    const keybindings = KeybindingsManager.create();
+    const editor = new BashModeEditor(
+      { requestRender() {}, terminal: { columns: 80, rows: 24 } },
+      { borderColor: (text: string) => text },
+      keybindings,
+      {
+        keybindings,
+        isBashModeActive: () => false,
+        isShellRunning: () => false,
+        onExitBashMode() {},
+        onSubmitCommand() {},
+        onInterrupt() {},
+        onNotify() {},
+        getHistoryEntries: () => [],
+        areCompletionsEnabled: () => false,
+        resolveGhostSuggestion: async () => null,
+      },
+    );
+    editor.setText("x".repeat(5000));
+    Reflect.get(editor, "pastes").set(1, "pasted text");
+    let visualMapCalls = 0;
+    const buildVisualLineMap = Reflect.get(editor, "buildVisualLineMap").bind(editor);
+    Reflect.set(editor, "buildVisualLineMap", (width: number) => {
+      visualMapCalls += 1;
+      return buildVisualLineMap(width);
+    });
+
+    editor.handleInput("\x1b[D");
+    assert.equal(visualMapCalls, 1);
+    assert.deepEqual(editor.getCursor(), { line: 0, col: 4999 });
+  } finally {
+    links.cleanup();
+  }
+});
+
+test("bash editor horizontal fast path falls back at mixed Unicode boundaries", async () => {
+  const links = ensureEditorModuleLinks();
+
+  try {
+    const { BashModeEditor } = await import("../bash-mode/editor.ts");
+    const { KeybindingsManager } = await import(new URL("../node_modules/@earendil-works/pi-coding-agent/dist/core/keybindings.js", import.meta.url).href);
+    const keybindings = KeybindingsManager.create();
+    const editor = new BashModeEditor(
+      { requestRender() {}, terminal: { columns: 80, rows: 24 } },
+      { borderColor: (text: string) => text },
+      keybindings,
+      {
+        keybindings,
+        isBashModeActive: () => false,
+        isShellRunning: () => false,
+        onExitBashMode() {},
+        onSubmitCommand() {},
+        onInterrupt() {},
+        onNotify() {},
+        getHistoryEntries: () => [],
+        areCompletionsEnabled: () => false,
+        resolveGhostSuggestion: async () => null,
+      },
+    );
+    const text = `${"x".repeat(4998)}\u0600a`;
+    editor.setText(text);
+    editor.handleInput("\x1b[D");
+    assert.deepEqual(editor.getCursor(), { line: 0, col: 4998 });
+
+    editor.handleInput("\x1b[C");
+    assert.deepEqual(editor.getCursor(), { line: 0, col: 5000 });
+  } finally {
+    links.cleanup();
+  }
+});
+
+test("bash editor fast path preserves plain custom keybindings", async () => {
+  const links = ensureEditorModuleLinks();
+
+  try {
+    const { BashModeEditor } = await import("../bash-mode/editor.ts");
+    const { KeybindingsManager } = await import(new URL("../node_modules/@earendil-works/pi-coding-agent/dist/core/keybindings.js", import.meta.url).href);
+    const { getKeybindings, setKeybindings } = await import(resolvePiTuiModuleUrl("dist/index.js"));
+    const previousKeybindings = getKeybindings();
+    const keybindings = new KeybindingsManager({ "tui.editor.cursorLeft": "a" });
+
+    try {
+      setKeybindings(keybindings);
+      const editor = new BashModeEditor(
+        { requestRender() {}, terminal: { columns: 80, rows: 24 } },
+        { borderColor: (text: string) => text },
+        keybindings,
+        {
+          keybindings,
+          isBashModeActive: () => false,
+          isShellRunning: () => false,
+          onExitBashMode() {},
+          onSubmitCommand() {},
+          onInterrupt() {},
+          onNotify() {},
+          getHistoryEntries: () => [],
+          resolveGhostSuggestion: async () => null,
+        },
+      );
+
+      editor.setText("x");
+      editor.handleInput("a");
+      assert.equal(editor.getText(), "x");
+      assert.deepEqual(editor.getCursor(), { line: 0, col: 0 });
+
+      keybindings.setUserBindings({ "tui.editor.cursorLeft": "shift+a" });
+      Reflect.set(editor, "plainBoundInputs", null);
+      editor.handleInput("A");
+      assert.equal(editor.getText(), "x");
+      assert.deepEqual(editor.getCursor(), { line: 0, col: 0 });
+    } finally {
+      setKeybindings(previousKeybindings);
+    }
   } finally {
     links.cleanup();
   }
@@ -1108,8 +1691,9 @@ test("bash editor runs copied Pi app action handlers for alt-enter", async () =>
   try {
     const { BashModeEditor } = await import("../bash-mode/editor.ts");
     const { KeybindingsManager } = await import(new URL("../node_modules/@earendil-works/pi-coding-agent/dist/core/keybindings.js", import.meta.url).href);
-    const { setKittyProtocolActive } = await import(new URL("../node_modules/@earendil-works/pi-tui/dist/keys.js", import.meta.url).href);
-    const keybindings = KeybindingsManager.create();
+    const { setKittyProtocolActive } = await import(resolvePiTuiModuleUrl("dist/keys.js"));
+    // Avoid loading user-level keybindings.json in this test.
+    const keybindings = new KeybindingsManager({ "app.message.followUp": "alt+enter" });
     const editor = new BashModeEditor(
       { requestRender() {}, terminal: { columns: 80, rows: 24 } },
       {},
@@ -1154,7 +1738,7 @@ test("bash editor command-z undoes deleted text for supported encodings only", a
   try {
     const { BashModeEditor } = await import("../bash-mode/editor.ts");
     const { KeybindingsManager } = await import(new URL("../node_modules/@earendil-works/pi-coding-agent/dist/core/keybindings.js", import.meta.url).href);
-    const keybindings = KeybindingsManager.create();
+    const keybindings = new KeybindingsManager();
     const createEditor = (options: {
       keybindings?: typeof keybindings;
       isBashModeActive?: () => boolean;
@@ -1279,6 +1863,7 @@ test("bash editor command-z resets shell history and updates ghost state", async
     Reflect.set(shellEditor, "shellHistoryItems", ["git status"]);
     Reflect.set(shellEditor, "shellHistoryDraft", "git");
     shellEditor.handleInput("\x1b[122;9u");
+    await new Promise((resolve) => setTimeout(resolve, 75));
 
     assert.equal(shellEditor.getText(), "a");
     assert.equal(Reflect.get(shellEditor, "shellHistoryIndex"), -1);
@@ -1549,7 +2134,7 @@ test("bash editor does not accept a hidden ghost suggestion when the cursor is n
     const { BashModeEditor } = await import("../bash-mode/editor.ts");
     const accepted = getMethod(BashModeEditor.prototype, "acceptGhostSuggestion").call({
       ghost: { value: "git status", source: "project-history" },
-      getExpandedText() {
+      getText() {
         return "git st";
       },
       getCursor() {

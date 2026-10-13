@@ -9,7 +9,7 @@
     "*.json",
     "!progress.md",
     "bash-mode/**/*.ts",
-    "fixed-editor/**/*.ts",
+    "queue/**/*.ts",
     "sub-usages/**/*.ts"
   ],
   "keywords": [
@@ -20,13 +20,14 @@
     "status-bar",
     "power-user",
     "editor",
-    "fixed-editor",
     "shortcut-palette",
     "bash-mode",
     "extension"
   ],
   "author": "Nico Bailon",
-  "contributors": ["mariczne"],
+  "contributors": [
+    "mariczne"
+  ],
   "license": "MIT",
   "repository": {
     "type": "git",
@@ -40,17 +41,20 @@
     "access": "public"
   },
   "scripts": {
+    "typecheck": "tsc --noEmit",
     "test": "node --experimental-strip-types --test tests/**/*.test.ts"
   },
   "peerDependencies": {
-    "@earendil-works/pi-ai": ">=0.74.0 <0.81.0",
-    "@earendil-works/pi-coding-agent": ">=0.74.0 <0.81.0",
-    "@earendil-works/pi-tui": ">=0.74.0 <0.81.0"
+    "@earendil-works/pi-ai": ">=0.81.0",
+    "@earendil-works/pi-coding-agent": ">=0.81.0",
+    "@earendil-works/pi-tui": ">=0.81.0"
   },
   "devDependencies": {
-    "@earendil-works/pi-ai": "^0.80.3",
-    "@earendil-works/pi-coding-agent": "^0.80.3",
-    "@earendil-works/pi-tui": "^0.80.3"
+    "@earendil-works/pi-ai": "1.1.0",
+    "@earendil-works/pi-coding-agent": "1.1.0",
+    "@earendil-works/pi-tui": "1.1.0",
+    "@types/node": "24.13.3",
+    "typescript": "5.9.3"
   },
   "pi": {
     "extensions": [

@@ -1,33 +1,295 @@
 # Changelog
 
+This fork (`@mariczne/pi-power-user`) tracks [pi-powerline-footer](https://github.com/nicobailon/pi-powerline-footer). Entries below the Unreleased section are upstream release notes; fork-specific changes are listed under Unreleased.
+
 ## [Unreleased]
 
+### Changed
+- **Merged upstream v0.20.1** — Brings in the Powerline Queue, `/reply`, `/cd`, delayed send, Jev auto follow-up, cost currency display, subagent cost totals, secondary-row wrapping, `Ctrl+S` stash, configurable high/xhigh/max thinking colors, editor and footer performance work, and the git, context, and welcome fixes listed in the upstream notes below.
+- **Native pi layout** — Removed the extension-owned fixed editor, chat scrolling, scroll-away card, mouse selection/copy, and chat jump shortcuts. pi's own fullscreen mode (the default since pi 1.0) now provides fixed input, transcript scrolling, and selection. This also fixes the editor cursor disappearing on pi 1.2, where the fixed editor bypassed pi's new fake-cursor rendering.
+- **Pi compatibility** — Requires pi 0.81 or newer; developed against pi 1.1.
+- **Data directory** — Queue and currency-rate caches join stash and bash history under `pi-power-user/` in the agent dir.
+
+### Kept from the fork
+- **Shortcut palette** (`/powerline shortcuts`, `ctrl+shift+k`), now also listing the queue and reply actions.
+- **Subscription quota windows** for `anthropic`, `openai-codex`, and `opencode-go` in the `cost` segment.
+- **Provider shown next to the model** by default.
+- **Welcome is opt-in** (`powerline.welcome: true`).
+- **`high` thinking uses the normal theme color**; only `xhigh` and `max` default to rainbow.
+- **Working Vibes stay removed**, including upstream's later vibe changes.
+
+
+## [0.20.1] - 2026-10-12
+
+### Fixed
+- **Extension-started turns on Pi 1.2.0** — When another extension starts a turn with a custom message, such as a background job reporting that it finished, Powerline no longer fails with `Cannot read properties of undefined (reading 'replace')`. Auto follow-up and Working Vibes keep using your last real prompt. Thanks to [@gambtho](https://github.com/gambtho) for #248.
+
+## [0.20.0] - 2026-10-10
+
+### Highlights
+- On narrow terminals, the secondary row can now continue onto extra rows instead of cutting off segments that don't fit.
+- Working vibes work again with OpenCode and OpenCode Go models.
+
 ### Added
-- **Separator override** — Added `powerline.separator` so separator style can be chosen independently of the active preset.
-- **Git host icon** — Added opt-in `powerline.git.hostIcon` to show the detected origin host icon in the branch label.
-- **Segment display formats** — Added opt-in `powerline.context.format` and `powerline.cache_read.format` settings for percentage-style displays.
-- **Selection copy control** — Added opt-in `powerline.copyOnSelect`; selections stay highlighted by default for explicit `ctrl+c` or right-click copying.
-- **Shortcut palette** — `/powerline shortcuts` or `ctrl+shift+k` opens a searchable command palette with the active Powerline bindings (prefixed `Powerline: `) plus standard pi keybindings. Fuzzy-search by typing, run the highlighted action with enter. Editor keybindings appear as reference entries; bindings scoped to pi's modal selectors are omitted since those UIs show their own hints.
+- **Wrap the secondary row** — Set `powerline.secondaryOverflow` to `"wrap"` and segments that don't fit on the secondary row move to extra rows below it instead of disappearing on narrow terminals. The default, `"drop"`, keeps the current behavior. Thanks to [@raveensrk](https://github.com/raveensrk) for #244.
+
+### Fixed
+- **Working vibes on OpenCode Go** — Working vibes with an OpenCode or OpenCode Go model no longer fail with `400 MissingSessionID`. This needs Pi 0.86.0 or later (#245).
+
+## [0.19.1] - 2026-10-02
+
+### Fixed
+- **Esc with auto follow-up** — Pressing `Esc` while Jev is still deciding whether to send your message now or after the current task no longer starts a new turn with that message. Instead, waiting messages go back into the editor in the order you sent them, above your current draft. If the task finishes without you pressing `Esc`, the message is still sent as before.
+
+## [0.19.0] - 2026-09-30
+
+### Highlights
+- Pick your own colors for the `high`, `xhigh`, and `max` thinking levels instead of the rainbow.
+- Press `Ctrl+S` in the editor to stash or restore your draft, just like `Alt+S`.
+- Web frontends such as pi-web no longer show a row of empty Powerline panels.
+- The VS Code extension and Pi Desktop no longer pop up the welcome screen as a dialog.
+
+### Added
+- **Thinking level colors** — New `thinkingHigh`, `thinkingXhigh`, and `thinkingMax` theme colors let the `high`, `xhigh`, and `max` thinking levels use a theme color or hex value. The default is still `rainbow`, and `rainbow` is now accepted as a color value. Thanks to [@jstettner](https://github.com/jstettner) for #241.
+- **Ctrl+S stash** — `Ctrl+S` now stashes and restores the editor draft like `Alt+S` while the editor has focus. Pi's selectors keep their own `Ctrl+S` actions. Thanks to [@leiyangyou](https://github.com/leiyangyou) for #242.
+
+### Fixed
+- **Web frontends** — Web frontends such as pi-web now show only the main Powerline bar instead of a row of empty panels. Thanks to [@moxuun](https://github.com/moxuun) for #238.
+- **VS Code and Pi Desktop** — The startup welcome now appears only in the terminal, so the VS Code extension and Pi Desktop no longer open it as a dialog. Thanks to [@xuyuansheng](https://github.com/xuyuansheng) for #240.
+
+## [0.18.0] - 2026-09-26
+
+### Highlights
+- Delay outgoing messages briefly and press `Esc` to return them to the editor before they are sent.
+- Let Jev queue non-urgent messages as follow-ups while Pi is busy.
+- Extension statuses now keep their colors contained and use cleaner, consistent spacing.
+- Session and model labels show more accurate names in the footer.
+
+### Added
+- **Delayed send** — Set `powerline.sendDelayMs` to hold prompts and steering messages briefly before sending. Press `Esc` to return the message to the editor.
+- **Auto follow-up** — Set `powerline.autoFollowUp` with `TYPESAFE_API_KEY` to let Jev queue messages that can wait instead of interrupting the current task.
+
+### Fixed
+- **Extension status colors** — Isolate each status's ANSI styling so colors do not leak into separators or neighboring statuses. Thanks to [@fank](https://github.com/fank).
+- **Pipe and slash spacing** — Avoid double padding around pipe and slash separators. Thanks to [@fank](https://github.com/fank).
+- **Qualified model display** — Include the provider for model IDs with nested paths without duplicating an existing provider prefix. Thanks to [@acidnik](https://github.com/acidnik) for #227.
+- **Extension status spacing** — Use a single padded separator between statuses. Thanks to [@tutu359](https://github.com/tutu359) for #229.
+- **Session label** — Show the current session display name when available instead of its short ID. Thanks to [@tutu359](https://github.com/tutu359) for #230.
+
+## [0.17.2] - 2026-09-20
+
+### Highlights
+- Stashed drafts now survive `/reload` and remain isolated to the current session.
+- Responsive footer details no longer take an extra row away from the editor.
+- Border colors and welcome-screen resource counts stay accurate as your setup changes.
+- Git failures and multilingual Working Vibes messages are handled more gracefully.
+
+### Fixed
+- **Editor stash reload safety** — Preserve the active editor stash across `/reload` without carrying it into another session. Thanks to [@Avg8888](https://github.com/Avg8888) for #220.
+- **Fullscreen footer space** — Show responsive secondary details in the reserved footer row instead of taking another row away from the editor. Thanks to [@JBP-1994](https://github.com/JBP-1994) for #217.
+- **Live editor border colors** — Keep Powerline borders in sync with Pi's active editor mode. Thanks to [@drewmala](https://github.com/drewmala) for #221.
+- **Accurate welcome counts** — Show accurate counts for loaded skills and prompt templates, including package-provided resources, and omit the unreliable extension count. Thanks to [@MORAY-charlie](https://github.com/MORAY-charlie) for #218.
+- **Git polling failures** — Keep the footer responsive and retain available Git details when the Git process cannot start. Thanks to [@hhhhddh](https://github.com/hhhhddh) for #219.
+- **Working Vibes punctuation** — Use appropriate ellipses in Latin, Chinese, Japanese, and Korean messages. Thanks to [@kyrie2to11](https://github.com/kyrie2to11) for #215.
+
+## [0.17.1] - 2026-09-10
+
+### Highlights
+- Large idle sessions now settle instead of repeatedly redrawing the full interface.
+- Working Vibes handles thinking-level model names and session reloads more reliably.
+- Older Git versions and the Kaku terminal now display the expected branch and Nerd Font details.
+
+### Changed
+- **Working Vibes default model** — Use `openai-codex/gpt-5.6-luna:low` for generated status messages.
+
+### Fixed
+- **Idle CPU usage** — Avoid repeated full-screen redraws when background Git checks return unchanged results.
+- **Legacy Git support** — Display the current branch on Git versions older than 2.22. Thanks to [@chengxiang1997](https://github.com/chengxiang1997) for #206.
+- **Kaku terminal support** — Recognize Kaku as a Nerd Font-capable terminal. Thanks to [@DeH40](https://github.com/DeH40) for #207.
+- **Working Vibes model selection** — Handle `:low` and other thinking-level suffixes when selecting the configured model.
+- **Working Vibes reload safety** — Keep the fallback message when generation finishes after a session reload. Thanks to [@efuentesp](https://github.com/efuentesp) for #210.
+
+## [0.17.0] - 2026-09-04
+
+### Highlights
+- Prompts typed during compaction start when Pi is ready, without another keypress.
+- Welcome startup and footer updates do less background work.
+- Git details and thinking levels stay in sync with your current session.
+- Choose whether `/compact <text>` supplies compaction instructions or queues a prompt.
+- Install with newer Pi versions without an artificial version ceiling.
+
+### Added
+- **Compact prompt mode** — Set `powerline.queue.compactPromptMode: "native"` to use `/compact <text>` for custom compaction instructions instead of queuing a prompt. The default behavior is unchanged. Thanks to [@joshuajbrunner](https://github.com/joshuajbrunner) for #191.
+
+### Changed
+- **Pi compatibility** — Allow newer Pi versions while keeping the minimum at 0.81.0.
+- **Git updates** — Avoid unnecessary Git commands when Git information is not displayed. Existing polling settings and dirty branch colors still work (#201).
+- **Welcome startup** — Load recent sessions without blocking startup, and stop loading when the welcome screen is dismissed or the session changes (#199).
+- **Queue display** — Avoid rereading an unchanged inbox and skip footer summaries when the queue segment is disabled or omitted. Queue previews and actions still work (#200).
+- **Powerline placement** — Clarified that the primary Powerline row can be shown above or below the editor. Thanks to [@smileBeda](https://github.com/smileBeda) for #188.
+
+### Fixed
+- **Post-compaction queue delivery** — Start queued prompts when Pi becomes idle after successful compaction, including manual compaction and retries, without further input. Cancel pending delivery if compaction fails or the session ends. Detecting failures from compaction started outside Powerline requires Pi 0.84.3 or newer (#198).
+- **Git session details** — Show the branch, status, and remote-host icons for the current session's directory, refreshing when the session or branch changes (#194). Thanks to [@lengxf](https://github.com/lengxf) for the report.
+- **Terminal detection** — Use `TERM` as a fallback only when `TERM_PROGRAM` is unset when detecting Nerd Font support. Thanks to [@a5ehren](https://github.com/a5ehren) for #192/#195.
+- **Live thinking-level display** — Update the footer when the thinking level changes instead of showing a stale value such as `think:off`. Thanks to [@csp256](https://github.com/csp256) for #196.
+
+## [0.16.0] - 2026-08-25
+
+### Highlights
+- Quote earlier messages with `/reply` without installing a separate extension.
+- Keep custom status colors intact with `customItems[].selfColorize`.
+- Stash drafts now stay out of the editor until you explicitly restore them.
+- Stash history opens faster because project prompt history loads only when you ask for it.
+- Windows users no longer see git console windows flash during footer polling or bash completion.
+
+### Added
+- **Quote previous messages** — Added `/reply` to insert a previous user or assistant message as a Markdown quote. The optional `powerlineShortcuts.reply` shortcut is disabled by default and loads the picker only when used.
+- **Self-colored custom items** — Added `customItems[].selfColorize` so extension statuses can keep embedded ANSI colors, including multiple colors within one item, without being wrapped by the configured custom-item color. Thanks to [@elecnix](https://github.com/elecnix) for #176.
+
+### Changed
+- **Editor stash restore** — Stashed editor text now stays stashed after agent runs. Restore it with `Alt+S` or stash history when you want it back. Closes #183.
+- **Stash history loading** — Recent project prompts now load only when you select that source, and the project scan reads bounded tails from the newest session files. Closes #184.
+
+### Fixed
+- **Windows git polling** — Hide spawned git child-process consoles so detached Windows hosts do not flash a visible window on each footer poll or bash completion. Thanks to [@xing-shuyin](https://github.com/xing-shuyin) for #180.
+
+## [0.15.1] - 2026-08-19
+
+### Fixed
+- **Post-compaction queue delivery** — Prompts typed during compaction now stay queued until compaction finishes, instead of being marked blocked by an intermediate settled state. Closes #174.
+
+## [0.15.0] - 2026-08-15
+
+### Added
+- **Working vibe colors** — Added `powerline.workingVibes.color` so vibe text can use Pi theme colors, hex colors, or `rainbow`. Thanks to [@jummyliu](https://github.com/jummyliu) for #170.
+
+### Changed
+- **Pi 0.84 compatibility** — Widened Pi package peer dependency ranges to `>=0.81.0 <0.85.0` and refreshed dev dependencies against `@earendil-works/*` 0.84.1, so `pi-powerline-footer` installs cleanly with Pi 0.84.x packages. Thanks to [@brunoessmann](https://github.com/brunoessmann) for #168.
+
+### Fixed
+- **Post-compaction queue delivery** — Mark queued prompts as sent only after Pi starts them, and requeue them if startup does not happen.
+
+## [0.14.1] - 2026-08-13
+
+### Fixed
+- **Welcome keypress passthrough** — First input now dismisses the startup welcome UI immediately and forwards that key to the editor so typing starts without an extra keystroke. Closes #166.
+
+## [0.14.0] - 2026-08-12
+
+### Changed
+- **Editor cursor responsiveness** — Avoid full visual remaps or grapheme scans for safe plain-ASCII cursor movement and forward delete on long single-line drafts.
+
+## [0.13.0] - 2026-08-12
+
+### Changed
+- **Editor typing responsiveness** — Avoid expanding paste markers or joining full drafts in editor hot paths, debounce bash ghost completion, run git completion lookups asynchronously, cache queue/prompt render work, use a bounded fast render path for large editor drafts, and avoid full grapheme scans when deleting plain ASCII from long lines. Opt-in profiling and render A/B flags now identify remaining editor costs without affecting normal sessions.
+- **Editor hot-path cleanup** — Simplified type narrowing in the fast Backspace path without changing behavior.
+- **Bash completions are opt-in** — Disable Powerline bash ghost suggestions and one-off `!command` predictions by default. Set `bashMode.completions` to `true` to re-enable them.
+- **GitHub Actions runtime** — Updated checkout and Node setup actions to their Node 24 runtime versions.
+
+### Fixed
+- **Git polling no longer takes `.git/index.lock`** — Read-only git commands now run with `GIT_OPTIONAL_LOCKS=0`, so polling `git status` stops refreshing the index as a side effect, which raced interactive git in the same repo and could leave an orphaned lock behind. Thanks to Max Kaye (@XertroV) for #156.
+
+### Removed
+- **Saved idea inbox** — Removed unused idea capture commands, sigil capture, and issue handoff. The queue now manages queued prompts only.
+
+## [0.12.3] - 2026-08-09
+
+### Fixed
+- **Post-compaction context display** — Show a clearly marked estimate from the active compacted context after compaction or `/reload`, instead of stale pre-compaction usage or an unknown placeholder.
+
+## [0.12.2] - 2026-08-08
+
+### Fixed
+- **Fullscreen footer height** — Return one blank footer line so the Powerline footer matches Pi fullscreen dock sizing at startup. Thanks to @acidnik for #144.
+- **Global shell history fallback** — Cache unreadable global history files as empty until their fingerprint changes, so bash mode keeps working without logging a stack on every keypress. Thanks to @RomainMuller for #143.
+- **Post-compaction queue delivery** — Snapshot the queue context before delayed delivery so a reload or session replacement cannot crash by reading a stale extension context. Thanks to @pascalandy for the report in nicobailon/pi-subagents#897.
+
+## [0.12.1] - 2026-08-04
+
+### Fixed
+- **Queue preview labels** — Saved ideas now show an `idea:` preview label instead of looking like normal queued prompts, while deliverable, sending, and blocked queue items keep distinct labels.
+
+## [0.12.0] - 2026-08-03
+
+### Added
+- **Strict TypeScript gate** — Added a source-only TypeScript check pinned to TypeScript 5.9.3 and Node 24 typings, plus a GitHub Actions workflow that runs typecheck before tests on Ubuntu and Windows.
+- **Saved-idea follow-up commands** — Added `/ideas next` to send the oldest active captured idea to the current session, plus `/idea issue [id]` and `/ideas issue [id]` to hand saved ideas to the current agent for guarded GitHub issue triage.
+
+### Fixed
+- **Compaction lifecycle support** — Switched compaction-aware queue delivery to Pi's supported `session_before_compact` and `session_compact` extension lifecycle instead of internal session events.
+
+## [0.11.0] - 2026-08-03
+
+### Added
+- **Powerline Queue + Inbox** — Added a file-backed queue and idea inbox for capturing thoughts without interrupting the current agent. Messages submitted during compaction are held by Powerline and delivered after successful compaction, while failed or cancelled compactions leave them blocked and visible. `/compact <text>` now compacts and queues `<text>` as the next prompt instead of treating it as compaction-summary instructions. New `/idea`, `/ideas`, and `/queue` commands manage captured ideas, queued prompts, project aliases, retries, clears, and current-session delivery; the `queue` segment and preview row surface active queue, idea, and blocked counts.
+- **Sigil idea capture** — Added leading-`#` idea capture so typing `# <idea>` and pressing Enter saves the idea instead of sending it. The sigil is configurable through `powerline.queue.captureSigil`, the editor prompt glyph switches to `#` while drafting a captured idea, stash history entries can be promoted to ideas, and delivered ideas include provenance for orchestrator handoff.
+- **Combined cache-read format** — Added opt-in `powerline.cache_read.format: "both"` to show raw cache-read tokens alongside the cache hit rate, for example `cache in: 12k (80%)`. Thanks to e (@edabchann) for #136.
+
+## [0.10.0] - 2026-08-02
+
+### Changed
+- **Long-session footer responsiveness** — Footer refreshes now reuse the active session branch and core context result while its leaf is unchanged, pull urgent paints ahead of queued streaming refreshes, and repaint as soon as background git data arrives. This removes repeated full-session walks from the interactive render path without slowing status updates.
+- **Minimum Pi version** — Working vibes now stream through the model registry's provider, which Pi exposes from 0.81.0 onward, so the supported Pi range is `>=0.81.0 <0.84.0`.
+
+### Fixed
+- **Vibe generation with extension-registered providers** — Fixed `No API provider registered for api: <name>` when the vibe model came from a provider registered by another extension. Pi 0.81 moved those providers out of the shared API table that the previous code path resolved against. Vibe requests now also carry resolved provider environment values and credential-derived base URLs, so profile-based and proxied providers reach the right endpoint. Thanks to Thurston Sandberg (@thurstonsand) for #134.
+
+## [0.9.0] - 2026-07-31
+
+### Added
+- **Cost currency display** — Added optional non-USD display for the `cost` segment via `powerline.cost.currency`, with background FX-rate caching. Thanks to @tanuki-cat for #130.
+- **Subagent cost accounting** — Added subagent child-run cost to the `cost` segment total so parallel/worker runs are reflected in session spend. Thanks to Ričardas Čubukinas (@xadips) for #128.
+
+### Changed
+- **Native fixed input cutover** — Removed the extension-owned fixed editor and chat scrolling; Pi now owns native input and feed scrolling.
+
+### Fixed
+- **Vibe generation theme parsing** — Fixed `/vibe generate` so multi-word theme names parse correctly when an optional count is provided. Thanks to Hacxy (@hacxy) for #127.
+
+## [0.8.1] - 2026-07-30
+
+### Changed
+- **Interactive hot-path performance** — Shell history ghost suggestions now cache project and global history behind file-fingerprint validation instead of re-reading and re-parsing history files on every keystroke; fixed-editor cluster rendering only width-normalizes rows that can reach the terminal instead of every candidate line; and streaming token-stat updates reuse the append-only session prefix instead of rescanning the full event list. Measured on stress workloads with byte-identical output: 100k-line zsh history reads ~5,500x faster, large fixed-editor redraws ~390x faster, and 20k-event streaming token updates ~300x faster.
+
+## [0.8.0] - 2026-07-29
+
+### Added
+- **Session directory switching** — Added `/cd <path>` to continue the current conversation from another working directory while keeping Pi tools and the footer path segment in sync. Thanks to chengxiang (@chengxiang1997) for #114.
+- **Separator override** — Added `powerline.separator` so separator style can be chosen independently of the active preset. Thanks to Andy8647 and mj-meyer for #106/#116.
+- **Git host icon** — Added opt-in `powerline.git.hostIcon` to replace the git branch icon with a detected GitHub, GitLab, Bitbucket, or generic git host icon when an origin remote is available. Thanks to Andy8647 for #113.
+- **Segment display formats** — Added opt-in `powerline.context.format` and `powerline.cache_read.format` settings for compact percentage-style context and cache-read segments. Thanks to Andy8647 for #109.
+- **copyOnSelect toggle** — Added `powerline.copyOnSelect` (default `true`) to control whether mouse text selection auto-copies to clipboard on release. Set to `false` to disable auto-copy; the selection then stays highlighted with a `N characters selected, ctrl+c to copy` hint, and copies explicitly via `ctrl+c` or right-click. Thanks to Andy8647 for #105.
+- **Scroll-away card toggle** — Added `powerline.scrollAwayCard` and `/powerline scroll-away-card on|off|toggle` so the fixed editor and chat navigation shortcuts can remain enabled while the scroll-away hint card is hidden. Thanks to Alexander Gerdes (@Avg8888), Whisperfall, and Bruno Orsolon (@brunoorsolon) for #97/#108/#99.
+
+### Changed
+- **TypeScript cleanup** — Tightened local result and helper types around vibe generation, prompt history, context usage, and bash history reset paths.
+- **Inline custom UI repainting** — Avoids rerendering static chat while fixed-editor inline custom UI clusters repaint with unchanged viewport geometry. Thanks to JMHSV for #111.
+- **Status render caching** — Caches session token aggregation between unchanged render inputs and keeps stale git segment values visible during background refreshes, reducing long-session redraw work and git flicker. Thanks to Andy8647 for #107.
+- **Fixed-editor scrolling performance** — Uses terminal row shifts, cached transcript lines, an 8 ms repaint cadence, and transient shortcut-card hiding during active wheel movement to cut scroll latency and terminal output churn.
+
+### Fixed
+- **Fixed-editor output padding** — Applies top-level `outputPad` as the fixed-editor outer inset so fixed-editor mode matches Pi’s regular output spacing. Thanks to Gabriel Dehan for #104.
+- **Fixed-editor keyboard negotiation** — Retries extended keyboard mode setup briefly after entering the alternate screen so late Kitty/modifyOtherKeys negotiation is enabled on the active screen. Thanks to Raymond Ko for #102.
+- **Theme override path** — Loads `theme.json` from the documented agent-dir `extensions/powerline-footer` path before falling back to the loaded package directory, and clarifies setup docs for `showLastPrompt` and layout rows. Thanks to MeisterP for #117.
+- **Print-mode terminal cleanup** — Terminal reset and cursor restoration sequences run only during interactive TUI shutdowns, keeping `pi -p` output visible. Thanks to Sergey Konkin (@sergeykonkin) for #101.
+
+## [0.7.0] - 2026-07-14
+
+### Added
+- **Fixed-editor scroll-away shortcut hint card** — Shows a stacked bottom/user/assistant shortcut card when chat is scrolled away from the bottom; clicking anywhere in the card jumps back to the bottom when fixed-editor mouse handling is enabled.
 - **Welcome toggle** — Added `powerline.welcome` so the startup welcome UI can be disabled without disabling the footer. Thanks to OCPdev25, miloslavnosek, vzeazy, and Florian Kinder (@fank) for #48/#89.
 - **Display options** — Added `powerline.cost.subscriptionDisplay` and `powerline.model.display` for subscription cost and provider-qualified model names. Thanks to Alexandr Burdiyan (@burdiyan), Meidhy (@dymayday), Mathu Mounasamy (@Mathuv), and pserey for #3/#83/#50.
 - **Legacy sharp-S stash opt-in** — Added `powerline.stashSharpSShortcut` for users who intentionally want printable `ß` to trigger stash. Thanks to SebastianRuettiRuettger and Filip (@filipores) for #39/#84.
 - **Contribution guide** — Added lightweight bug report, feature request, PR, testing, docs, and changelog guidance. Thanks to OCPdev25 for #49.
-- **Agent-dir path support** — Respects `PI_CODING_AGENT_DIR` for global powerline settings, stash history, sessions, skills, commands, and extension discovery. Thanks to Hrand Liu (@IstPlayer) for #86.
+- **Agent-dir path support** — Respects `PI_CODING_AGENT_DIR` for global powerline settings, stash history, sessions, vibes, skills, commands, and extension discovery. Thanks to Hrand Liu (@IstPlayer) for #86.
 - **Segment disabling** — Added `powerline.disabledSegments` to hide built-in or configured custom segments from any preset. Thanks to Brian Lange (@bjlange) for #88.
 - **Startup token estimate** — The welcome UI now shows an approximate initial system-prompt token count before the first message. Thanks to Ibrahim Mohammed (@IbrahimMohammed47) for #80.
-- **Configurable segment layout** — Added `powerline.layout` for exact `left`, `right`, and `secondary` group overrides on any preset, including explicit `custom:<id>` placement. Thanks to Bruno Orsolon (@brunoorsolon), Thurston Sandberg (@thurstonsand), and Arthur Bodera (@Thinkscape) for #54/#40/#37.
+- **Configurable segment layout** — Added `powerline.layout` for exact `left`, `right`, and `secondary` group overrides on any preset, including explicit `custom:<id>` placement. This replaces the misleading fixed `custom` preset. Thanks to Bruno Orsolon (@brunoorsolon), Thurston Sandberg (@thurstonsand), and Arthur Bodera (@Thinkscape) for #54/#40/#37.
 - **Primary row placement** — Added `powerline.placement` and `/powerline placement above|below|toggle` to move the primary powerline row around the editor while keeping notifications and responsive overflow in their existing groups. Thanks to Rogerio Saulo (@rsaulo) for #77.
 
-### Removed
-- **Fixed `custom` preset** — Use `powerline.layout` with another preset instead.
-
 ### Changed
-- **Fixed-editor repainting** — Avoids rerendering static chat when fixed inline UI repaints without viewport geometry changes.
-- **Status render caching** — Caches session token aggregation and serves stale git values during background refreshes to reduce redraw work and flicker.
-- **Fixed-editor scrolling performance** — Uses terminal row shifts, cached transcript lines, throttled repainting, and transient shortcut-card hiding during wheel movement.
-- **Welcome is now opt-in** — The startup welcome overlay/header is off by default. Set `powerline.welcome: true` to re-enable it. Previously it was on by default and required `powerline.welcome: false` to disable.
-- **Fixed-editor scroll-away card** — The scroll-away navigation card is now opt-in through `powerline.scrollAwayNavigationCard` or `/powerline scroll-away-card on`.
-- **Thinking level colors** — `high` now uses the normal `thinkingHigh` theme color; only `xhigh` and `max` use the rainbow treatment.
 - **Herdr and tmux scroll guidance** — Keeps fixed-editor mouse scrolling enabled by default and documents that host multiplexer scrollback needs `/powerline fixed-editor off`.
 - **Bottom jump shortcut** — Uses `ctrl+alt+g` as the default fixed-editor jump-to-bottom shortcut instead of `ctrl+shift+g`.
 - **Stash shortcut safety** — Literal `ß` is no longer consumed as stash by default; unambiguous Alt/Meta-S escape encodings still work.
@@ -36,11 +298,9 @@
 - **Shortcut disabling** — `powerlineShortcuts` and `bashMode.toggleShortcut` now treat `null` or `""` as explicit disabled values and omit disabled chat jumps from fixed-editor hints. Thanks to Koen De Jaeger (@kdejaeger) for #73.
 - **Editor autocomplete composition** — Powerline now passes Pi's autocomplete provider through a previous editor's `setAutocompleteProvider()` before adding bash-mode wrappers, preserving prior autocomplete-provider wrappers where possible. Thanks to Tifan Dwi Avianto (@tifandotme) for #61.
 - **Context usage display** — The context segment now shows used tokens, maximum tokens, and percentage together. Thanks to Fayi Femi-Balogun (@fayimora) for #92.
-- **Maximum thinking style** — Pi's `max` thinking level uses the rainbow treatment alongside `xhigh`. Thanks to @AiraNadih for #94.
+- **Maximum thinking style** — Pi's `max` thinking level now uses the same rainbow treatment as `high` and `xhigh`. Thanks to @AiraNadih for #94.
 
 ### Fixed
-- **Theme override path** — Loads `theme.json` from the documented agent-dir `extensions/powerline-footer` path before the installed package directory.
-- **Print-mode terminal cleanup** — Runs terminal resets and cursor restoration only during interactive TUI shutdowns so `pi -p` output remains visible.
 - **Fixed-editor wheel bursts** — Coalesces rapid mouse-wheel packets into throttled viewport repaints and defers the follow-up TUI render until scrolling settles, reducing flicker and slowdowns in terminal multiplexers.
 - **Welcome discovery noise** — Ignored vanished/dangling skill, extension, and prompt-template entries during welcome overlay discovery instead of printing stack traces.
 - **Reload keyboard protocol** — Preserves extended keyboard modes on `/reload` and only hard-resets them on real quit. Thanks to Francesco Buldo (@frabul), Alexander Gerdes (@Avg8888), and Sylvain Rivierre (@slhad) for #81/#82/#85.

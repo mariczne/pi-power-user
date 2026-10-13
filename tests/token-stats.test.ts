@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
-import { computeSessionTokenStats, SessionTokenStatsCache } from "../token-stats.ts";
+import { computeSessionTokenStats, SessionBranchCache, SessionTokenStatsCache } from "../token-stats.ts";
 
 function makeUsage(input: number, output: number, cacheRead = 0, cacheWrite = 0, costPerToken = 0.001) {
   return {
@@ -32,6 +32,56 @@ function userEvent() {
   };
 }
 
+function subagentToolResultEvent(costs: number[]) {
+  return {
+    type: "message",
+    message: {
+      role: "toolResult",
+      toolName: "subagent",
+      details: { results: costs.map((cost) => ({ usage: { cost } })) },
+    },
+  };
+}
+
+function subagentSlashResultEvent(costs: number[]) {
+  return {
+    type: "custom_message",
+    customType: "subagent-slash-result",
+    details: { result: { details: { results: costs.map((cost) => ({ usage: { cost } })) } } },
+  };
+}
+
+test("session branch cache reuses a leaf path and refreshes when the leaf changes", () => {
+  const cache = new SessionBranchCache();
+  let leafId = "leaf-1";
+  let branch: unknown[] = [{ id: leafId, value: 1 }];
+  let branchReads = 0;
+  const provider = {
+    getLeafId: () => leafId,
+    getBranch: () => {
+      branchReads += 1;
+      return branch;
+    },
+  };
+
+  assert.deepEqual(cache.get(null), []);
+
+  const first = cache.get(provider);
+  (branch[0] as { value: number }).value = 2;
+  assert.equal(cache.get(provider), first);
+  assert.equal((cache.get(provider)[0] as { value: number }).value, 2);
+  assert.equal(branchReads, 1);
+
+  leafId = "leaf-2";
+  branch = [...branch, { id: leafId }];
+  assert.equal(cache.get(provider), branch);
+  assert.equal(branchReads, 2);
+
+  cache.reset();
+  cache.get(provider);
+  assert.equal(branchReads, 3);
+});
+
 test("computeSessionTokenStats aggregates usage and tracks thinking level", () => {
   const events = [
     userEvent(),
@@ -51,6 +101,18 @@ test("computeSessionTokenStats aggregates usage and tracks thinking level", () =
   assert.ok(Math.abs(stats.cost - 0.074) < 1e-12);
   assert.equal(stats.lastAssistant, (events[5] as any).message);
   assert.equal(stats.thinkingLevelFromSession, "high");
+});
+
+test("computeSessionTokenStats sums subagent child run cost from tool results and slash results", () => {
+  const events = [
+    userEvent(),
+    assistantEvent(makeUsage(10, 5)),
+    subagentToolResultEvent([0.12, 0.34]),
+    subagentSlashResultEvent([0.5]),
+  ];
+
+  const stats = computeSessionTokenStats(events);
+  assert.ok(Math.abs(stats.subagentCost - 0.96) < 1e-12);
 });
 
 test("computeSessionTokenStats ignores assistant messages without tokens for lastAssistant", () => {
@@ -103,6 +165,21 @@ test("cache recomputes when the last event is updated in place (streaming)", () 
   assert.notEqual(second, first);
   assert.equal(second.output, 42);
   assert.equal(second.lastAssistant, tail.message);
+});
+
+test("cache recomputes when the last subagent result cost is updated in place", () => {
+  const cache = new SessionTokenStatsCache();
+  const tail = subagentToolResultEvent([0.1]);
+  const events = [assistantEvent(makeUsage(10, 5)), tail];
+
+  const first = cache.get(events);
+  assert.equal(first.subagentCost, 0.1);
+
+  tail.message.details.results = [{ usage: { cost: 0.3 } }];
+
+  const second = cache.get(events);
+  assert.notEqual(second, first);
+  assert.equal(second.subagentCost, 0.3);
 });
 
 test("cache recomputes when the last event turns into an error in place", () => {
@@ -165,7 +242,8 @@ test("reset forces recomputation", () => {
 
 test("index.ts wires the token stats cache into buildSegmentContext", () => {
   const source = readFileSync(new URL("../index.ts", import.meta.url), "utf-8");
-  assert.match(source, /import \{ SessionTokenStatsCache \} from "\.\/token-stats\.ts";/);
+  assert.match(source, /import \{ SessionBranchCache, SessionTokenStatsCache \} from "\.\/token-stats\.ts";/);
+  assert.match(source, /sessionBranchCache\.get\(ctx\.sessionManager\)/);
   assert.match(source, /tokenStatsCache\.get\(sessionEvents\)/);
   assert.match(source, /tokenStatsCache\.reset\(\)/);
 });

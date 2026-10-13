@@ -1,5 +1,5 @@
 /**
- * Theme system for pi-power-user
+ * Theme system for powerline-footer
  * 
  * Colors are resolved in order:
  * 1. User overrides from theme.json (if exists)
@@ -31,16 +31,19 @@ const DEFAULT_COLORS: Required<ColorScheme> = {
   thinkingLow: "thinkingLow",
   thinkingMedium: "thinkingMedium",
   thinkingHigh: "thinkingHigh",
+  thinkingXhigh: "rainbow",
+  thinkingMax: "rainbow",
   context: "dim",
   contextWarn: "warning",
   contextError: "error",
   cost: "text",
   tokens: "muted",
+  queue: "accent",
   separator: "dim",
   border: "borderMuted",
 };
 
-// Rainbow colors for extreme thinking levels
+// Rainbow colors for high thinking levels
 const RAINBOW_COLORS = [
   "#b281d6", "#d787af", "#febc38", "#e4c00f", 
   "#89d281", "#00afaf", "#178fb9", "#b281d6",
@@ -184,6 +187,10 @@ export function applyColor(
   color: ColorValue,
   text: string
 ): string {
+  if (color === "rainbow") {
+    return rainbow(text);
+  }
+
   if (isHexColor(color)) {
     return `${hexToAnsi(color)}${text}\x1b[0m`;
   }
@@ -217,7 +224,7 @@ export function fg(
 }
 
 /**
- * Apply rainbow gradient to text (for xhigh and max thinking levels)
+ * Apply rainbow gradient to text (for high thinking levels)
  */
 export function rainbow(text: string): string {
   let result = "";

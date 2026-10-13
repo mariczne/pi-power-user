@@ -1,6 +1,10 @@
 import { visibleWidth } from "@earendil-works/pi-tui";
+import { normalizeCostCurrency } from "./currency-rates.ts";
 import { BUILTIN_STATUS_LINE_SEGMENT_IDS } from "./types.ts";
 import type { ColorValue, CustomItemPosition, CustomStatusItem, PowerlinePlacement, PresetDef, StatusLineLayout, StatusLinePreset, StatusLineSegmentId, StatusLineSegmentOptions, StatusLineSeparatorStyle } from "./types.ts";
+
+export type CompactPromptMode = "queue" | "native";
+export type SecondaryOverflow = "drop" | "wrap";
 
 export interface PowerlineConfig {
   preset: StatusLinePreset;
@@ -11,15 +15,15 @@ export interface PowerlineConfig {
   invalidLayoutSegments: string[];
   separator: StatusLineSeparatorStyle | null;
   segmentOptions: StatusLineSegmentOptions;
-  mouseScroll: boolean;
-  fixedEditor: boolean;
-  scrollAwayNavigationCard: boolean;
-  /** Whether mouse text selection copies to clipboard. Default false. */
-  copyOnSelect: boolean;
   placement: PowerlinePlacement;
   invalidPlacement: string | null;
+  secondaryOverflow: SecondaryOverflow;
+  invalidSecondaryOverflow: string | null;
   welcome: boolean;
   stashSharpSShortcut: boolean;
+  queue: { compactPromptMode: CompactPromptMode };
+  sendDelayMs: number;
+  autoFollowUp: boolean;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -43,6 +47,20 @@ function normalizePlacement(value: unknown): { placement: PowerlinePlacement; in
   return {
     placement: "above",
     invalidPlacement: typeof value === "string" ? value.trim() : String(value),
+  };
+}
+
+function normalizeSecondaryOverflow(value: unknown): { secondaryOverflow: SecondaryOverflow; invalidSecondaryOverflow: string | null } {
+  if (value === undefined) return { secondaryOverflow: "drop", invalidSecondaryOverflow: null };
+
+  const normalized = typeof value === "string" ? value.trim().toLowerCase() : "";
+  if (normalized === "drop" || normalized === "wrap") {
+    return { secondaryOverflow: normalized, invalidSecondaryOverflow: null };
+  }
+
+  return {
+    secondaryOverflow: "drop",
+    invalidSecondaryOverflow: typeof value === "string" ? value.trim() : String(value),
   };
 }
 
@@ -91,6 +109,7 @@ function normalizeCustomPrefix(value: unknown): string | undefined {
   return normalized ? normalized : undefined;
 }
 
+
 function normalizeCustomStatusItem(raw: unknown, idOverride?: string): CustomStatusItem | null {
   if (!isRecord(raw)) return null;
   const id = normalizeCustomItemId(idOverride ?? raw.id);
@@ -103,6 +122,7 @@ function normalizeCustomStatusItem(raw: unknown, idOverride?: string): CustomSta
     statusKey,
     position: normalizeCustomItemPosition(raw.position),
     color: normalizeCustomColor(raw.color),
+    selfColorize: raw.selfColorize === true,
     prefix: normalizeCustomPrefix(raw.prefix),
     hideWhenMissing: raw.hideWhenMissing !== false,
     excludeFromExtensionStatuses: raw.excludeFromExtensionStatuses !== false,
@@ -211,6 +231,13 @@ function normalizeLayout(
     : { layout: null, invalidLayoutSegments };
 }
 
+function normalizeQueueOptions(raw: unknown): PowerlineConfig["queue"] {
+  if (!isRecord(raw)) return { compactPromptMode: "queue" };
+  return {
+    compactPromptMode: raw.compactPromptMode === "native" ? "native" : "queue",
+  };
+}
+
 function normalizeSegmentOptions(raw: Record<string, unknown>): StatusLineSegmentOptions {
   const options: StatusLineSegmentOptions = {};
 
@@ -249,12 +276,14 @@ function normalizeSegmentOptions(raw: Record<string, unknown>): StatusLineSegmen
   }
 
   if (isRecord(raw.cost)) {
+    const currency = normalizeCostCurrency(raw.cost.currency);
     options.cost = {
       ...(raw.cost.subscriptionDisplay === "subscription"
         || raw.cost.subscriptionDisplay === "reported-cost"
         || raw.cost.subscriptionDisplay === "both"
         ? { subscriptionDisplay: raw.cost.subscriptionDisplay }
         : {}),
+      ...(currency ? { currency } : {}),
     };
   }
 
@@ -266,7 +295,9 @@ function normalizeSegmentOptions(raw: Record<string, unknown>): StatusLineSegmen
 
   if (isRecord(raw.cache_read)) {
     options.cache_read = {
-      ...(raw.cache_read.format === "tokens" || raw.cache_read.format === "percent" ? { format: raw.cache_read.format } : {}),
+      ...(raw.cache_read.format === "tokens" || raw.cache_read.format === "percent" || raw.cache_read.format === "both"
+        ? { format: raw.cache_read.format }
+        : {}),
     };
   }
 
@@ -300,14 +331,15 @@ export function parsePowerlineConfig(value: unknown, presets: readonly StatusLin
     invalidLayoutSegments: [],
     separator: null,
     segmentOptions: {},
-    mouseScroll: true,
-    fixedEditor: true,
-    scrollAwayNavigationCard: false,
-    copyOnSelect: false,
     placement: "above",
     invalidPlacement: null,
+    secondaryOverflow: "drop",
+    invalidSecondaryOverflow: null,
     welcome: false,
     stashSharpSShortcut: false,
+    queue: { compactPromptMode: "queue" },
+    sendDelayMs: 0,
+    autoFollowUp: false,
   };
 
   const directPreset = normalizePreset(value, presets);
@@ -319,6 +351,7 @@ export function parsePowerlineConfig(value: unknown, presets: readonly StatusLin
   const { disabledSegments, invalidDisabledSegments } = normalizeDisabledSegments(value.disabledSegments, customItems);
   const { layout, invalidLayoutSegments } = normalizeLayout(value.layout, customItems);
   const { placement, invalidPlacement } = normalizePlacement(value.placement);
+  const { secondaryOverflow, invalidSecondaryOverflow } = normalizeSecondaryOverflow(value.secondaryOverflow);
 
   return {
     preset: normalizePreset(value.preset, presets) ?? defaultConfig.preset,
@@ -329,14 +362,17 @@ export function parsePowerlineConfig(value: unknown, presets: readonly StatusLin
     invalidLayoutSegments,
     separator: normalizeSeparator(value.separator),
     segmentOptions: normalizeSegmentOptions(value),
-    mouseScroll: value.mouseScroll !== false,
-    fixedEditor: value.fixedEditor !== false,
-    scrollAwayNavigationCard: value.scrollAwayNavigationCard === true,
-    copyOnSelect: value.copyOnSelect === true,
     placement,
     invalidPlacement,
+    secondaryOverflow,
+    invalidSecondaryOverflow,
     welcome: value.welcome === true,
     stashSharpSShortcut: value.stashSharpSShortcut === true,
+    queue: normalizeQueueOptions(value.queue),
+    sendDelayMs: typeof value.sendDelayMs === "number" && Number.isFinite(value.sendDelayMs) && value.sendDelayMs > 0
+      ? value.sendDelayMs
+      : 0,
+    autoFollowUp: value.autoFollowUp === true,
   };
 }
 
@@ -397,7 +433,7 @@ export function nextPowerlineSettingWithPreset(existingPowerlineSetting: unknown
 
 export function nextPowerlineSettingWithOptions(
   existingPowerlineSetting: unknown,
-  updates: Partial<Pick<PowerlineConfig, "mouseScroll" | "fixedEditor" | "scrollAwayNavigationCard" | "copyOnSelect" | "welcome" | "stashSharpSShortcut" | "placement">>,
+  updates: Partial<Pick<PowerlineConfig, "welcome" | "stashSharpSShortcut" | "placement">>,
   currentPreset: StatusLinePreset,
 ): unknown {
   if (!isRecord(existingPowerlineSetting)) {
@@ -432,12 +468,14 @@ export function getNotificationExtensionStatuses(
   return notifications;
 }
 
-export function normalizeExtensionStatusValue(value: string): string | null {
+export function normalizeExtensionStatusValue(value: string, preserveAnsi = false): string | null {
   if (!value || visibleWidth(value) <= 0) {
     return null;
   }
 
-  const stripped = value.replace(/(\x1b\[[0-9;]*m|\s|·|[|])+$/, "");
+  const stripped = preserveAnsi
+    ? value.replace(/(\s|·|[|])+$/, "")
+    : value.replace(/(\x1b\[[0-9;]*m|\s|·|[|])+$/, "");
   return visibleWidth(stripped) > 0 ? stripped : null;
 }
 

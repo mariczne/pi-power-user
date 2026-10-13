@@ -1,18 +1,7 @@
-export function shouldShowStartupWelcome(reason: unknown, welcomeEnabled: boolean): boolean {
-  return reason === "startup" && welcomeEnabled;
-}
-
-export function shouldResetExtendedKeyboardModesOnShutdown(hasUI: boolean, reason: unknown): boolean {
-  return hasUI && reason === "quit";
-}
-
-export function shouldRestoreInlineEditorCursorOnShutdown(
-  hasUI: boolean,
-  reason: unknown,
-  fixedEditorEnabled: boolean,
-  hadFixedEditorCompositor: boolean,
-): boolean {
-  return hasUI && reason === "quit" && !fixedEditorEnabled && !hadFixedEditorCompositor;
+// The welcome is terminal art. RPC hosts such as VS Code and Pi Desktop render
+// custom UI as dialogs, so only the terminal UI shows it.
+export function shouldShowStartupWelcome(reason: unknown, welcomeEnabled: boolean, mode: unknown): boolean {
+  return reason === "startup" && welcomeEnabled && mode === "tui";
 }
 
 export function isStaleExtensionContextError(error: unknown): boolean {
