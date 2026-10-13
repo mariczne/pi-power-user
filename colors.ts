@@ -32,7 +32,6 @@ const THEME = {
   path: "#00afaf",        // Teal/cyan
   gitClean: "#5faf5f",    // Green
   accent: "#febc38",      // Orange
-  queue: "#febc38",       // Orange
 };
 
 // Color name to ANSI code mapping

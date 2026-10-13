@@ -188,7 +188,6 @@ test("powerline shortcut help lists active bindings and omits disabled bindings"
     stashHistory: null,
     copyEditor: "ctrl+alt+c",
     cutEditor: null,
-    queueOpen: null,
     reply: null,
     editorStart: "super+shift+up",
     editorEnd: null,

@@ -9,7 +9,6 @@
     "*.json",
     "!progress.md",
     "bash-mode/**/*.ts",
-    "queue/**/*.ts",
     "sub-usages/**/*.ts"
   ],
   "keywords": [

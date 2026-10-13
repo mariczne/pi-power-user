@@ -42,7 +42,6 @@ function createSegmentContext(options: StatusLineSegmentOptions = {}, overrides:
     autoCompactEnabled: true,
     customCompactionEnabled: false,
     usingSubscription: false,
-    queueSummary: { queueCount: 0, blockedCount: 0, compacting: false, leadingText: null, leadingIntent: null, leadingStatus: null },
     sessionStartTime: Date.now(),
     shellModeActive: false,
     shellRunning: false,
@@ -173,29 +172,6 @@ test("cache_read percent and both formats handle zero input without NaN", () => 
 
   const hidden = createSegmentContext({ cache_read: { format: "both" } });
   assert.deepEqual(renderSegment("cache_read", hidden), { content: "", visible: false });
-});
-
-// ── queue segment ──────────────────────────────────────────────────────────
-
-test("queue segment hides when empty", () => {
-  const ctx = createSegmentContext();
-  assert.deepEqual(renderSegment("queue", ctx), { content: "", visible: false });
-});
-
-test("queue segment summarizes queued and blocked items", () => {
-  const ctx = createSegmentContext({}, {
-    queueSummary: { queueCount: 2, blockedCount: 1, compacting: false, leadingText: "fix README", leadingIntent: "post-compact", leadingStatus: "blocked" },
-  });
-
-  assert.equal(stripAnsi(renderSegment("queue", ctx).content), "q 2 · blocked 1");
-});
-
-test("queue segment highlights compaction-held prompts", () => {
-  const ctx = createSegmentContext({}, {
-    queueSummary: { queueCount: 1, blockedCount: 0, compacting: true, leadingText: "run after compact", leadingIntent: "post-compact", leadingStatus: "queued" },
-  });
-
-  assert.equal(stripAnsi(renderSegment("queue", ctx).content), "compact q 1");
 });
 
 // ── config parsing / merging ────────────────────────────────────────────────

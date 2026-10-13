@@ -3,7 +3,6 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { NERD_ICONS } from "../icons.ts";
 import { isStaleExtensionContextError, shouldShowStartupWelcome } from "../lifecycle.ts";
-import { __resetCurrencyRatesForTest, __setCurrencyRatesForTest } from "../currency-rates.ts";
 import { renderSegment } from "../segments.ts";
 import type { SegmentContext } from "../types.ts";
 
@@ -148,9 +147,7 @@ test("extension statuses isolate colors from separators and subsequent statuses"
   }
 });
 
-test("cost segment supports subscription display modes and converted currencies", () => {
-  __setCurrencyRatesForTest({ CNY: 7.2 });
-
+test("cost segment supports subscription display modes", () => {
   const subscription = renderSegment("cost", createSegmentContext({
     usingSubscription: true,
     usageStats: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0.42, subagentCost: 0 },
@@ -176,12 +173,6 @@ test("cost segment supports subscription display modes and converted currencies"
   const withSubagentCost = renderSegment("cost", createSegmentContext({
     usageStats: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0.42, subagentCost: 0.58 },
   }));
-  const convertedCurrency = renderSegment("cost", createSegmentContext({
-    usageStats: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 1, subagentCost: 0.25 },
-    options: { cost: { currency: "CNY" } },
-  }));
-
-  __resetCurrencyRatesForTest();
 
   assert.deepEqual(subscription, { content: "(sub)", visible: true });
   assert.deepEqual(reportedCost, { content: "$0.42", visible: true });
@@ -189,7 +180,6 @@ test("cost segment supports subscription display modes and converted currencies"
   assert.deepEqual(zeroReported, { content: "(sub)", visible: true });
   assert.deepEqual(zeroBoth, { content: "(sub)", visible: true });
   assert.deepEqual(withSubagentCost, { content: "$1.00", visible: true });
-  assert.deepEqual(convertedCurrency, { content: "¥9.00", visible: true });
 });
 
 test("context segment shows used tokens, maximum, and percentage", () => {
@@ -222,17 +212,7 @@ test("stale ctx guard handles old and new Pi messages on agent_end", () => {
   assert.match(source, /if \(!isStaleExtensionContextError\(error\)\) throw error;\r?\n\s+currentCtx = null;\r?\n\s+return;/);
 });
 
-test("queue delivery tracks acknowledgement and requeues unstarted messages on shutdown", () => {
-  assert.match(source, /trackPendingQueueDelivery\(item, deliveryText\);\r?\n\s+if \(deliverAs\) \{/);
-  assert.match(source, /function requeuePendingQueueDeliveries\(error: string\): void \{/);
-  assert.match(source, /requeuePendingQueueDeliveries\("Session ended before queued message started"\);/);
-  assert.match(source, /finishPendingQueueDelivery\(event\.prompt, ctx\);/);
-  assert.match(source, /finishPendingQueueDelivery\(getPromptHistoryText\(message\.content\), ctx\);/);
-});
-
-test("editor-adjacent widgets cache queue and last-prompt work", () => {
-  assert.match(source, /const QUEUE_SUMMARY_CACHE_TTL_MS = 250;/);
-  assert.match(source, /queueSummaryCache = null;\r?\n\s+requestImmediateStatusRender/);
+test("last-prompt widget caches its render", () => {
   assert.match(source, /lastPromptRenderCache\.source === lastUserPrompt/);
 });
 
@@ -240,6 +220,6 @@ test("unknown context estimates are event-scoped and cleared before compaction",
   assert.match(source, /approximateContextUsage = event\.reason === "reload" \? estimateUnknownContextUsage\(ctx\) : null;/);
   assert.match(source, /unknownCoreFallback: approximateContextUsage,/);
   assert.match(source, /contextApproximate = coreContextUsage\?\.contextTokens === null && approximateContextUsage !== null;/);
-  assert.match(source, /pi\.on\("session_before_compact", async \(_event, ctx\) => \{\r?\n\s+powerlineCompacting = true;\r?\n\s+currentCtx = ctx;\r?\n\s+isStreaming = false;\r?\n\s+liveAssistantUsage = null;\r?\n\s+approximateContextUsage = null;\r?\n\s+coreContextUsageCache\.reset\(\);/);
-  assert.match(source, /pi\.on\("session_compact", async \(event, ctx\) => \{\r?\n\s+powerlineCompacting = false;\r?\n\s+currentCtx = ctx;\r?\n\s+isStreaming = false;\r?\n\s+liveAssistantUsage = null;\r?\n\s+approximateContextUsage = estimateUnknownContextUsage\(ctx\);\r?\n\s+coreContextUsageCache\.reset\(\);/);
+  assert.match(source, /pi\.on\("session_before_compact", async \(_event, ctx\) => \{\r?\n\s+currentCtx = ctx;\r?\n\s+isStreaming = false;\r?\n\s+liveAssistantUsage = null;\r?\n\s+approximateContextUsage = null;\r?\n\s+coreContextUsageCache\.reset\(\);/);
+  assert.match(source, /pi\.on\("session_compact", async \(_event, ctx\) => \{\r?\n\s+currentCtx = ctx;\r?\n\s+isStreaming = false;\r?\n\s+liveAssistantUsage = null;\r?\n\s+approximateContextUsage = estimateUnknownContextUsage\(ctx\);\r?\n\s+coreContextUsageCache\.reset\(\);/);
 });

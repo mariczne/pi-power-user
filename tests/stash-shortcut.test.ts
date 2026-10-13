@@ -6,7 +6,6 @@ import { join } from "node:path";
 import { matchesStashShortcutInput } from "../shortcuts.ts";
 import fs from "node:fs";
 import { syncBuiltinESMExports } from "node:module";
-import { PowerlineQueueStore } from "../queue/store.ts";
 import childProcess from "node:child_process";
 import type { ReadonlyFooterDataProvider } from "@earendil-works/pi-coding-agent";
 import { waitForGitUpdates } from "../git-status.ts";
@@ -454,50 +453,6 @@ test("Git rendering reuses the cwd-owned provider only on demand and refreshes a
     else process.env.POWERLINE_NERD_FONTS = oldFonts;
     restoreEnv();
     fs.rmSync(root, { recursive: true, force: true });
-  }
-});
-
-test("footer queue demand follows resolved layout while preview and picker stay independent", async () => {
-  for (const powerline of [
-    { preset: "full", disabledSegments: ["queue"] },
-    { layout: { left: ["model"], right: [], secondary: [] } },
-    { layout: { left: [], right: [], secondary: ["queue"] } },
-  ]) {
-    const root = mkdtempSync(join(tmpdir(), "powerline-queue-display-"));
-    writeFileSync(join(root, "settings.json"), JSON.stringify({ powerline: { welcome: false, ...powerline } }));
-    const inbox = join(root, "pi-power-user", "inbox.jsonl");
-    const store = new PowerlineQueueStore(inbox, join(root, "projects.json"));
-    store.add({ text: "independent preview", source: { cwd: root }, target: { kind: "global" }, intent: "follow-up" });
-    const { extension, restoreEnv } = await loadPowerline(root);
-    const fake = createFakePi();
-    const runtime = createCtx({ cwd: root, customInputs: [["\x1b"]] });
-    const originalRead = fs.readFileSync;
-    try {
-      extension(fake.pi);
-      await fake.handlers.get("session_start")?.({ reason: "resume" }, runtime.ctx);
-      const denied = Object.assign(new Error("inbox denied"), { code: "EACCES" });
-      fs.readFileSync = ((path, ...args) => {
-        if (path === inbox) throw denied;
-        return Reflect.apply(originalRead, fs, [path, ...args]);
-      }) as typeof fs.readFileSync;
-      syncBuiltinESMExports();
-      const renderFooter = () => runtime.widgets.get("powerline-top")!.render(120);
-      if (powerline.layout?.secondary.includes("queue")) assert.throws(renderFooter, denied);
-      else assert.doesNotThrow(renderFooter);
-      assert.throws(() => runtime.widgets.get("powerline-queue-preview")!.render(120), denied);
-      fs.readFileSync = originalRead;
-      syncBuiltinESMExports();
-      assert.match(runtime.widgets.get("powerline-queue-preview")!.render(120).join("\n"), /queued: independent preview/);
-      await fake.commands.get("queue")!.handler("", runtime.ctx);
-      assert.equal(runtime.customTitles.length, 1, "queue picker opens independently of footer layout");
-    } finally {
-      fs.readFileSync = originalRead;
-      syncBuiltinESMExports();
-      await fake.handlers.get("session_shutdown")?.({}, runtime.ctx);
-      await waitForGitUpdates();
-      restoreEnv();
-      fs.rmSync(root, { recursive: true, force: true });
-    }
   }
 });
 

@@ -38,7 +38,6 @@ const DEFAULT_COLORS: Required<ColorScheme> = {
   contextError: "error",
   cost: "text",
   tokens: "muted",
-  queue: "accent",
   separator: "dim",
   border: "borderMuted",
 };

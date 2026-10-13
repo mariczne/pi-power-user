@@ -5,10 +5,9 @@ This fork (`@mariczne/pi-power-user`) tracks [pi-powerline-footer](https://githu
 ## [Unreleased]
 
 ### Changed
-- **Merged upstream v0.20.1** — Brings in the Powerline Queue, `/reply`, `/cd`, delayed send, Jev auto follow-up, cost currency display, subagent cost totals, secondary-row wrapping, `Ctrl+S` stash, configurable high/xhigh/max thinking colors, editor and footer performance work, and the git, context, and welcome fixes listed in the upstream notes below.
+- **Merged upstream v0.20.1** — Brings in `/reply`, `/cd`, delayed send, subagent cost totals, secondary-row wrapping, `Ctrl+S` stash, configurable high/xhigh/max thinking colors, editor and footer performance work, and the git, context, and welcome fixes listed in the upstream notes below.
 - **Native pi layout** — Removed the extension-owned fixed editor, chat scrolling, scroll-away card, mouse selection/copy, and chat jump shortcuts. pi's own fullscreen mode (the default since pi 1.0) now provides fixed input, transcript scrolling, and selection. This also fixes the editor cursor disappearing on pi 1.2, where the fixed editor bypassed pi's new fake-cursor rendering.
 - **Pi compatibility** — Requires pi 0.81 or newer; developed against pi 1.1.
-- **Data directory** — Queue and currency-rate caches join stash and bash history under `pi-power-user/` in the agent dir.
 
 ### Kept from the fork
 - **Shortcut palette** (`/powerline shortcuts`, `ctrl+shift+k`), now also listing the queue and reply actions.
@@ -17,6 +16,12 @@ This fork (`@mariczne/pi-power-user`) tracks [pi-powerline-footer](https://githu
 - **Welcome is opt-in** (`powerline.welcome: true`).
 - **`high` thinking uses the normal theme color**; only `xhigh` and `max` default to rainbow.
 - **Working Vibes stay removed**, including upstream's later vibe changes.
+
+### Removed
+- **Powerline Queue** — Upstream's `/queue` command, `queue` segment, `ctrl+alt+q` picker, and editor-level `/compact` interception are not included. pi queues messages typed during compaction natively, and `/compact <text>` again passes `<text>` to pi as compaction instructions.
+- **Cost currency conversion** — Upstream's `powerline.cost.currency` (which fetched exchange rates from jsDelivr) is not included.
+- **Editor profiler** — Upstream's `/powerline-perf` command and `POWERLINE_DEBUG_PERF` / `POWERLINE_PERF_*` switches are not included; the editor speed-ups themselves are kept.
+- **Jev auto follow-up** — Upstream's `powerline.autoFollowUp` is not included; it sent busy-agent messages, the current task, and a snippet of the agent's reply to TypeSafe's hosted classifier.
 
 
 ## [0.20.1] - 2026-10-12

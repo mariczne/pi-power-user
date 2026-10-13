@@ -20,13 +20,13 @@ Restart pi to activate. Requires pi 0.81 or newer.
 ## Features
 
 **Powerline status bar** — Configurable segments (model, thinking, path, git,
-context, tokens, cost, queue, …) with preset layouts and separators. Nerd Font
+context, tokens, cost, …) with preset layouts and separators. Nerd Font
 auto-detection for iTerm, WezTerm, Kitty, Ghostty, Alacritty, and Kaku with
 ASCII fallbacks. Custom items via `powerline.customItems`.
 
 **Native pi layout** — pi owns the fixed input, transcript scrolling,
 selection, and copy (fullscreen is pi's default TUI mode since 1.0). This
-extension supplies the powerline rows plus the bash, stash, queue, and editor
+extension supplies the powerline rows plus the bash, stash, and editor
 integrations. The old extension-owned fixed editor has been removed; use pi's
 `tuiMode` setting instead.
 
@@ -50,11 +50,6 @@ dedicated `shell_mode` segment, streams command output into an embedded
 transcript below the editor, and lets `cd` or exported state persist across
 commands. Ghost suggestions are opt-in via `bashMode.completions: true`.
 
-**Powerline Queue** — Messages typed during compaction are held and delivered
-after successful compaction. `/queue` manages queued prompts (aliases, retries,
-clears, manual delivery); the `queue` segment shows active and blocked counts
-only when there is something to show.
-
 **Quote replies** — `/reply` inserts a previous user or assistant message as a
 Markdown quote while keeping the current draft.
 
@@ -62,10 +57,8 @@ Markdown quote while keeping the current draft.
 conversation from another working directory, keeping pi tools and the footer
 path segment in sync.
 
-**Delayed send and auto follow-up** — Optional: hold outgoing prompts for
-`powerline.sendDelayMs` so `Esc` can pull them back, and let TypeSafe's Jev
-route busy-agent messages to the follow-up queue with `powerline.autoFollowUp`.
-Both are off by default.
+**Delayed send** — Optional: hold outgoing prompts for `powerline.sendDelayMs`
+milliseconds so `Esc` can pull them back into the editor. Off by default.
 
 **Live thinking level indicator** — Shows current thinking level
 (`think:off`, `think:med`, etc.) with per-level colors. `xhigh` and `max` use a
@@ -80,8 +73,7 @@ Opencode Go scrapes the dashboard and requires `OPENCODE_GO_WORKSPACE_ID` plus
 `OPENCODE_GO_AUTH_COOKIE`; monthly usage is intentionally ignored for now. Usage
 is cached for 2 minutes (30s on error). Set `powerline.cost.subscriptionDisplay`
 to `"reported-cost"` for the reported dollar cost or `"both"` for cost plus the
-subscription/quota display. `powerline.cost.currency` converts reported cost
-into another currency.
+subscription/quota display.
 
 **Provider shown next to the model** — By default the `model` segment appends
 the active provider in parentheses (e.g. `Sonnet 4 (anthropic)`). Set
@@ -123,15 +115,6 @@ above|below|toggle`, and the shortcut palette with `/powerline shortcuts`.
 
 **Environment:** `POWERLINE_NERD_FONTS=1` to force Nerd Fonts, `=0` for ASCII.
 
-Queue commands:
-
-- `/compact <text>` — compact now and queue `<text>` as the next prompt (set
-  `powerline.queue.compactPromptMode: "native"` to pass `<text>` to pi as
-  compaction instructions instead)
-- `/queue` — open the queued-prompt picker
-- `/queue alias <name> [path]`, `/queue send [id]`, `/queue retry [id]`,
-  `/queue clear <id|all>`, `/queue target <id> @name|global|current`
-
 ## Configuration
 
 Set it in the agent settings file (`~/.pi/agent/settings.json` by default, or
@@ -147,7 +130,6 @@ under `PI_CODING_AGENT_DIR`) or project-local `.pi/settings.json`:
     "welcome": false,
     "secondaryOverflow": "drop",
     "sendDelayMs": 0,
-    "autoFollowUp": false,
     "customItems": [
       {
         "id": "ci",
@@ -165,7 +147,7 @@ under `PI_CODING_AGENT_DIR`) or project-local `.pi/settings.json`:
     "disabledSegments": [],
     "path": { "mode": "basename" },
     "model": { "display": "name" },
-    "cost": { "subscriptionDisplay": "subscription", "currency": "USD" },
+    "cost": { "subscriptionDisplay": "subscription" },
     "git": { "polling": "full" }
   }
 }
@@ -207,7 +189,6 @@ repositories without an origin retain the regular branch icon.
     "stashHistory": "ctrl+alt+h",
     "copyEditor": "ctrl+alt+c",
     "cutEditor": "ctrl+alt+x",
-    "queueOpen": "ctrl+alt+q",
     "reply": null,
     "editorStart": "cmd+shift+up",
     "editorEnd": "cmd+shift+down"
@@ -244,8 +225,7 @@ duplicate conflicts automatically fall back to safe defaults.
 
 ### Data files
 
-Stash history, bash history, queue state, and currency-rate caches live under
-`pi-power-user/` in the agent dir.
+Stash and bash history live under `pi-power-user/` in the agent dir.
 
 ### Theme overrides
 
@@ -274,6 +254,14 @@ periodically merged with it. Key divergences:
   rainbow to `high` too.
 - **Working Vibes removed** — The `/vibe` command and the `working-vibes.ts`
   module have been removed. The "Working…" status text is no longer themed.
+- **No Powerline Queue** — Upstream's `/queue`, `queue` segment, and `/compact
+  <text>` override are not included. pi natively queues messages typed during
+  compaction, and `/compact <text>` keeps pi's meaning (compaction instructions).
+- **No currency conversion or `/powerline-perf` profiler** — Cost is shown in
+  USD as reported by pi.
+- **No Jev auto follow-up** — Upstream's `powerline.autoFollowUp`, which sends
+  busy-agent messages to TypeSafe's hosted classifier to choose between steering
+  and follow-up, is not included. Use `Alt+Enter` to queue a follow-up.
 - **Separate data directory** — Persistent state lives under `pi-power-user/`
   instead of `powerline-footer/`, so both packages can coexist.
 

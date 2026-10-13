@@ -1,5 +1,4 @@
 import type { Theme, ThemeColor } from "@earendil-works/pi-coding-agent";
-import type { CostCurrencyCode } from "./currency-rates.ts";
 import type { SubscriptionUsage } from "./subscription-usage.ts";
 
 // Theme color - a pi theme color name, a custom hex color, or the rainbow effect
@@ -25,7 +24,6 @@ export type SemanticColor =
   | "contextError"
   | "cost"
   | "tokens"
-  | "queue"
   | "separator"
   | "border";
 
@@ -39,7 +37,6 @@ export const BUILTIN_STATUS_LINE_SEGMENT_IDS = [
   "path",
   "git",
   "subagents",
-  "queue",
   "token_in",
   "token_out",
   "token_total",
@@ -103,7 +100,7 @@ export interface StatusLineSegmentOptions {
     hostIcon?: boolean;
   };
   time?: { format?: "12h" | "24h"; showSeconds?: boolean };
-  cost?: { subscriptionDisplay?: "subscription" | "reported-cost" | "both"; currency?: CostCurrencyCode };
+  cost?: { subscriptionDisplay?: "subscription" | "reported-cost" | "both" };
   context?: { format?: "full" | "percent" };
   cache_read?: { format?: "tokens" | "percent" | "both" };
 }
@@ -159,15 +156,6 @@ export interface GitStatus {
 }
 
 // Usage statistics
-export interface QueueSummary {
-  queueCount: number;
-  blockedCount: number;
-  compacting: boolean;
-  leadingText: string | null;
-  leadingIntent: "steer" | "follow-up" | "post-compact" | null;
-  leadingStatus: "queued" | "blocked" | "delivering" | "sent" | "failed" | null;
-}
-
 export interface UsageStats {
   input: number;
   output: number;
@@ -205,7 +193,6 @@ export interface SegmentContext {
   customCompactionEnabled: boolean;
   usingSubscription: boolean;
   subscriptionUsage: SubscriptionUsage | null;
-  queueSummary: QueueSummary;
   sessionStartTime: number;
   shellModeActive: boolean;
   shellRunning: boolean;

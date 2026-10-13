@@ -5,7 +5,6 @@ import type { BuiltinStatusLineSegmentId, RenderedSegment, SegmentContext, Seman
 import { normalizeCompactExtensionStatus, normalizeExtensionStatusValue } from "./powerline-config.ts";
 import { fg, applyColor } from "./theme.ts";
 import { getIcons, SEP_DOT, getThinkingText } from "./icons.ts";
-import { formatUsdCost } from "./currency-rates.ts";
 import { getGitRemoteHost } from "./git-status.ts";
 import { formatSubscriptionUsageSummary } from "./subscription-usage.ts";
 import type { IconSet } from "./icons.ts";
@@ -255,28 +254,6 @@ const subagentsSegment: StatusLineSegment = {
   },
 };
 
-const queueSegment: StatusLineSegment = {
-  id: "queue",
-  render(ctx) {
-    const summary = ctx.queueSummary;
-    const parts: string[] = [];
-
-    if (summary.compacting && summary.queueCount > 0) {
-      parts.push(`compact q ${summary.queueCount}`);
-    } else if (summary.queueCount > 0) {
-      parts.push(`q ${summary.queueCount}`);
-    }
-
-
-    if (summary.blockedCount > 0) {
-      parts.push(`blocked ${summary.blockedCount}`);
-    }
-
-    if (parts.length === 0) return { content: "", visible: false };
-    return { content: color(ctx, "queue", parts.join(SEP_DOT)), visible: true };
-  },
-};
-
 const tokenInSegment: StatusLineSegment = {
   id: "token_in",
   render(ctx) {
@@ -324,7 +301,7 @@ const costSegment: StatusLineSegment = {
       return { content: "", visible: false };
     }
 
-    const reportedCost = cost > 0 ? formatUsdCost(cost, ctx.options.cost?.currency) : null;
+    const reportedCost = cost > 0 ? `$${cost.toFixed(2)}` : null;
     if (!usingSubscription) {
       return reportedCost
         ? { content: color(ctx, "cost", reportedCost), visible: true }
@@ -527,7 +504,6 @@ export const SEGMENTS: Record<BuiltinStatusLineSegmentId, StatusLineSegment> = {
   git: gitSegment,
   thinking: thinkingSegment,
   subagents: subagentsSegment,
-  queue: queueSegment,
   token_in: tokenInSegment,
   token_out: tokenOutSegment,
   token_total: tokenTotalSegment,

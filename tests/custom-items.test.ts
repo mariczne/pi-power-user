@@ -36,7 +36,6 @@ test("parsePowerlineConfig supports object config with custom items", () => {
   assert.equal(config.invalidPlacement, null);
   assert.equal(config.welcome, false);
   assert.equal(config.stashSharpSShortcut, false);
-  assert.deepEqual(config.queue, { compactPromptMode: "queue" });
 });
 
 test("parsePowerlineConfig accepts self-colored custom items", () => {
@@ -60,7 +59,6 @@ test("parsePowerlineConfig supports disabled segments", () => {
       preset: "default",
       customItems: [{ id: "ci" }],
       disabledSegments: [
-        "queue",
         "cost",
         " extension_statuses ",
         "custom:ci",
@@ -73,7 +71,7 @@ test("parsePowerlineConfig supports disabled segments", () => {
     ["default", "compact"],
   );
 
-  assert.deepEqual(config.disabledSegments, ["queue", "cost", "extension_statuses", "custom:ci"]);
+  assert.deepEqual(config.disabledSegments, ["cost", "extension_statuses", "custom:ci"]);
   assert.deepEqual(config.invalidDisabledSegments, ["unknown", "custom:missing", "123"]);
 });
 
@@ -194,24 +192,6 @@ test("parsePowerlineConfig validates secondary overflow mode", () => {
   assert.equal(invalid.invalidSecondaryOverflow, "scroll");
 });
 
-test("parsePowerlineConfig supports queue compact prompt mode", () => {
-  const defaultConfig = parsePowerlineConfig({}, ["default", "compact"]);
-  const native = parsePowerlineConfig(
-    { queue: { compactPromptMode: "native" } },
-    ["default", "compact"],
-  );
-  const invalid = parsePowerlineConfig(
-    { queue: { compactPromptMode: "passthrough" } },
-    ["default", "compact"],
-  );
-  const shorthand = parsePowerlineConfig("compact", ["default", "compact"]);
-
-  assert.deepEqual(defaultConfig.queue, { compactPromptMode: "queue" });
-  assert.deepEqual(native.queue, { compactPromptMode: "native" });
-  assert.deepEqual(invalid.queue, { compactPromptMode: "queue" });
-  assert.deepEqual(shorthand.queue, { compactPromptMode: "queue" });
-});
-
 test("parsePowerlineConfig supports welcome and legacy sharp-S settings", () => {
   const config = parsePowerlineConfig(
     { preset: "compact", welcome: false, stashSharpSShortcut: true },
@@ -234,12 +214,8 @@ test("parsePowerlineConfig extracts supported segment options", () => {
       path: { mode: "full", maxLength: 120 },
       git: { showBranch: false, showStaged: false, showUnstaged: true, showUntracked: false, polling: "branch", hostIcon: true },
       time: { format: "12h", showSeconds: true },
-      cost: { subscriptionDisplay: "both", currency: "cny" },
+      cost: { subscriptionDisplay: "both" },
     },
-    ["default", "compact"],
-  );
-  const invalidCurrency = parsePowerlineConfig(
-    { cost: { currency: "BTC" } },
     ["default", "compact"],
   );
 
@@ -248,9 +224,8 @@ test("parsePowerlineConfig extracts supported segment options", () => {
     path: { mode: "full", maxLength: 120 },
     git: { showBranch: false, showStaged: false, showUnstaged: true, showUntracked: false, polling: "branch", hostIcon: true },
     time: { format: "12h", showSeconds: true },
-    cost: { subscriptionDisplay: "both", currency: "CNY" },
+    cost: { subscriptionDisplay: "both" },
   });
-  assert.deepEqual(invalidCurrency.segmentOptions, { cost: {} });
 });
 
 test("mergeSegmentOptions lets user config override preset segment defaults", () => {

@@ -1,9 +1,7 @@
 import { visibleWidth } from "@earendil-works/pi-tui";
-import { normalizeCostCurrency } from "./currency-rates.ts";
 import { BUILTIN_STATUS_LINE_SEGMENT_IDS } from "./types.ts";
 import type { ColorValue, CustomItemPosition, CustomStatusItem, PowerlinePlacement, PresetDef, StatusLineLayout, StatusLinePreset, StatusLineSegmentId, StatusLineSegmentOptions, StatusLineSeparatorStyle } from "./types.ts";
 
-export type CompactPromptMode = "queue" | "native";
 export type SecondaryOverflow = "drop" | "wrap";
 
 export interface PowerlineConfig {
@@ -21,9 +19,7 @@ export interface PowerlineConfig {
   invalidSecondaryOverflow: string | null;
   welcome: boolean;
   stashSharpSShortcut: boolean;
-  queue: { compactPromptMode: CompactPromptMode };
   sendDelayMs: number;
-  autoFollowUp: boolean;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -231,13 +227,6 @@ function normalizeLayout(
     : { layout: null, invalidLayoutSegments };
 }
 
-function normalizeQueueOptions(raw: unknown): PowerlineConfig["queue"] {
-  if (!isRecord(raw)) return { compactPromptMode: "queue" };
-  return {
-    compactPromptMode: raw.compactPromptMode === "native" ? "native" : "queue",
-  };
-}
-
 function normalizeSegmentOptions(raw: Record<string, unknown>): StatusLineSegmentOptions {
   const options: StatusLineSegmentOptions = {};
 
@@ -276,14 +265,12 @@ function normalizeSegmentOptions(raw: Record<string, unknown>): StatusLineSegmen
   }
 
   if (isRecord(raw.cost)) {
-    const currency = normalizeCostCurrency(raw.cost.currency);
     options.cost = {
       ...(raw.cost.subscriptionDisplay === "subscription"
         || raw.cost.subscriptionDisplay === "reported-cost"
         || raw.cost.subscriptionDisplay === "both"
         ? { subscriptionDisplay: raw.cost.subscriptionDisplay }
         : {}),
-      ...(currency ? { currency } : {}),
     };
   }
 
@@ -337,9 +324,7 @@ export function parsePowerlineConfig(value: unknown, presets: readonly StatusLin
     invalidSecondaryOverflow: null,
     welcome: false,
     stashSharpSShortcut: false,
-    queue: { compactPromptMode: "queue" },
     sendDelayMs: 0,
-    autoFollowUp: false,
   };
 
   const directPreset = normalizePreset(value, presets);
@@ -368,11 +353,9 @@ export function parsePowerlineConfig(value: unknown, presets: readonly StatusLin
     invalidSecondaryOverflow,
     welcome: value.welcome === true,
     stashSharpSShortcut: value.stashSharpSShortcut === true,
-    queue: normalizeQueueOptions(value.queue),
     sendDelayMs: typeof value.sendDelayMs === "number" && Number.isFinite(value.sendDelayMs) && value.sendDelayMs > 0
       ? value.sendDelayMs
       : 0,
-    autoFollowUp: value.autoFollowUp === true,
   };
 }
 
